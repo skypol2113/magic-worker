@@ -1,0 +1,1665 @@
+// Magic Worker - ROOT version (real matches only, no synthetic)
+// ==============================================
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const translators = require('./worker/translators');
+const he = require('he');
+const _ = require('lodash');
+
+// ===== Assist / Env switches =====
+const ASSIST_ENABLED = (process.env.ASSIST_ENABLED || 'true').toLowerCase() === 'true';
+const ASSIST_ALLOW_ORIGINS = (process.env.ASSIST_ALLOW_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+// Провайдер ассиста по умолчанию — Vertex
+const ASSIST_PROVIDER = (process.env.ASSIST_PROVIDER || 'vertex').toLowerCase();
+
+// Универсальное имя модели: для Vertex берём VERTEX_MODEL, иначе ASSIST_MODEL
+const ASSIST_MODEL_UNIFIED =
+  process.env.VERTEX_MODEL ||
+  process.env.ASSIST_MODEL ||
+  'gemini-1.5-flash';
+
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '120', 10);
+const ASSIST_TIMEOUT_MS = parseInt(process.env.ASSIST_TIMEOUT_MS || '12000', 10);
+
+// ===== Embeddings Configuration =====
+const EMBEDDINGS_ENABLED = process.env.EMBEDDINGS_ENABLED === 'true';
+const EMBEDDINGS_MIN_SIM = parseFloat(process.env.EMBEDDINGS_MIN_SIM || '0.75');
+const EMBEDDINGS_CANDIDATE_LIMIT = parseInt(process.env.EMBEDDINGS_CANDIDATE_LIMIT || '200', 10);
+const EMBEDDINGS_TOP_K = parseInt(process.env.EMBEDDINGS_TOP_K || '5', 10);
+
+console.log('🔧 Translator:', (process.env.TRANSLATOR_PROVIDER || 'gct').toUpperCase());
+console.log('🔧 Embeddings:', (process.env.EMBEDDINGS_PROVIDER || 'vertex').toUpperCase(), `(${EMBEDDINGS_ENABLED ? 'ENABLED' : 'DISABLED'})`);
+console.log('🔮 Embeddings Config:', {
+  enabled: EMBEDDINGS_ENABLED,
+  minSimilarity: EMBEDDINGS_MIN_SIM,
+  candidateLimit: EMBEDDINGS_CANDIDATE_LIMIT,
+  topK: EMBEDDINGS_TOP_K,
+});
+
+// ===== Firebase Admin (глобально, один раз) =====
+const admin = require('firebase-admin');
+const FV = admin.firestore.FieldValue;
+const TS = admin.firestore.Timestamp;
+
+console.log('🎯 Magic Worker starting from ROOT directory');
+console.log('🔧 Environment check:');
+console.log('  project_id:', process.env.project_id);
+console.log('  client_email:', process.env.client_email);
+console.log('  private_key:', process.env.private_key ? 'EXISTS' : 'MISSING');
+
+// limit of real matches per intent (can be overridden via env)
+const MATCH_TOP_N = parseInt(process.env.MATCH_TOP_N || '1', 10);
+
+const app = express();
+app.use(cors());
+app.use((req, res, next) => {
+  if (!ASSIST_ENABLED) return next();
+  if (!ASSIST_ALLOW_ORIGINS.length) return next();
+  const origin = req.headers.origin;
+  if (origin && ASSIST_ALLOW_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    return res.status(204).end();
+  }
+  next();
+});
+app.use(express.json());
+
+function dehtml(s) {
+  if (!s) return '';
+  return he.decode(String(s).replace(/&nbsp;/g, ' '));
+}
+
+// ========== Firebase bootstrap ==========
+let firebaseLoaded = false;
+let db = null;
+
+function tryLoadFromConfigModule() {
+  try {
+    const { db: firebaseDb } = require('./config/firebase');
+    if (firebaseDb) {
+      db = firebaseDb;
+      firebaseLoaded = true;
+      console.log('✅ Firebase loaded via ./config/firebase');
+    }
+    if (admin.apps.length) {
+      console.log('✅ Admin initialized (from config module)');
+    }
+  } catch (e) {
+    console.log('ℹ️ config/firebase not used:', e.message);
+  }
+}
+
+function tryInitAdminFallback() {
+  if (firebaseLoaded || db) return;
+  try {
+    if (admin.apps.length === 0) {
+      const pk = (process.env.private_key || '').replace(/\\n/g, '\n');
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          project_id: process.env.project_id,
+          client_email: process.env.client_email,
+          private_key: pk,
+        }),
+      });
+    }
+    if (!db) db = admin.firestore();
+    firebaseLoaded = !!db;
+    console.log('✅ Firebase initialized via admin fallback');
+  } catch (e) {
+    console.error('❌ Firebase admin init failed:', e);
+  }
+}
+
+tryLoadFromConfigModule();
+tryInitAdminFallback();
+
+// ======= Helpers =======
+function nowIso() { return new Date().toISOString(); }
+function short(str, n = 80) { if (!str) return ''; return str.length > n ? str.substring(0, n) + '…' : str; }
+
+// Anti-dup check
+function docWasProcessed(doc) {
+  const d = doc.data() || {};
+  return !!d.workerProcessed || !!d.processedAt || !!d.workerVersion;
+}
+
+function get(obj, path, def = undefined) {
+  return path.split('.').reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj) ?? def;
+}
+
+// pairKey for match idempotency
+function pairKey(aUid, bUid, aIntentId, bIntentId) {
+  const u = [aUid || '', bUid || ''].sort().join('|');
+  const i = [aIntentId || '', bIntentId || ''].sort().join('|');
+  const raw = `${u}|${i}`;
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
+}
+
+// --- язык пользователя (preferences.interfaceLanguage в users_private)
+async function getUserLanguage(uid) {
+  try {
+    const privSnap = await db.doc(`users_private/${uid}`).get();
+    if (privSnap.exists) {
+      const prefs = privSnap.data()?.preferences;
+      return (prefs?.interfaceLanguage || 'en').toLowerCase();
+    }
+  } catch (e) {
+    console.warn(`getUserLanguage warn for ${uid}:`, e.message || e);
+  }
+  return 'en';
+}
+
+// --- корректный вызов translate()
+async function translateIfNeeded(text, sourceLang, targetLang) {
+  const from = (sourceLang || 'auto').toLowerCase();
+  const to   = (targetLang || 'en').toLowerCase();
+  if (!text) return '';
+  if (to === from) return text;
+  try {
+    const r = await translators.translate(text, to, from);
+    const out = r?.text ?? text;
+    console.log(`🌐 Translated: "${text}" → "${out}" (${from}→${to})`);
+    return out;
+  } catch (error) {
+    console.warn('❌ Translation failed, using original:', error?.message || error);
+    return text;
+  }
+}
+
+// --- Simple in-memory rate limiter (per IP or uid) ---
+const _assistBuckets = new Map(); // key -> { tokens, refillAt }
+function _assistAllow(key, limit = 8, windowMs = 60_000) {
+  const now = Date.now();
+  let b = _assistBuckets.get(key);
+  if (!b) {
+    b = { tokens: limit - 1, refillAt: now + windowMs };
+    _assistBuckets.set(key, b);
+    return true;
+  }
+  if (now > b.refillAt) {
+    b.tokens = limit - 1;
+    b.refillAt = now + windowMs;
+    return true;
+  }
+  if (b.tokens > 0) {
+    b.tokens -= 1;
+    return true;
+  }
+  return false;
+}
+
+// ---------- Suggestions sanitizer ----------
+function _cleanSuggestions(arr, lang) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seen = new Set();
+  for (let s of arr) {
+    if (typeof s !== 'string') continue;
+    s = he.decode(s).trim().replace(/\s+/g, ' ');
+    if (!s) continue;
+    if (s.length > 240) s = s.slice(0, 240).trim();
+    s = s.replace(/^\s*[\d-]+\s*[.)]\s*/, '').replace(/^["'«»]+|["'«»]+$/g, '');
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+// ===============================
+// ASSIST MODULE (Vertex + OpenAI)
+// ===============================
+const fetch = require('node-fetch');
+const { VertexAI } = require('@google-cloud/vertexai');
+
+async function _vertexAssistContinue({ text, lang }) {
+  const project = process.env.VERTEX_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT;
+  const location = process.env.VERTEX_LOCATION || 'us-central1';
+  const modelName = process.env.VERTEX_MODEL || 'gemini-2.5-pro';
+
+  if (!project) throw new Error('VERTEX_PROJECT_ID not set');
+  console.log(`[assist] Vertex model=${modelName}, project=${project}`);
+
+  const { VertexAI } = require('@google-cloud/vertexai');
+  const vertex = new VertexAI({ project, location });
+  const model = vertex.getGenerativeModel({ model: modelName });
+
+  const system =
+    'You suggest 3–5 short, natural continuations/refinements of a user wish. ' +
+    'Return ONLY a JSON array of strings, same language as the input. ' +
+    'No numbering, no quotes, no markdown. Each item <= 200 chars.';
+
+  const user =
+    `lang=${lang || 'auto'}\n` +
+    `text:\n${text}\n` +
+    `Return ONLY a JSON array of strings.`;
+
+  const resp = await model.generateContent({
+    systemInstruction: { role: 'system', parts: [{ text: system }] },
+    contents: [{ role: 'user', parts: [{ text: user }] }],
+    generationConfig: {
+      responseMimeType: 'application/json', // просим строго JSON
+      temperature: 0.7,
+    },
+  });
+
+  // пытаемся прочитать готовый JSON
+  const raw =
+    resp?.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '[]';
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);        // ожидаем уже массив
+  } catch {
+    // на всякий случай fallback: выдрать первый массив из текста
+    const m = raw.match(/\[[\s\S]*\]/);
+    parsed = m ? JSON.parse(m[0]) : [];
+  }
+
+  return _cleanSuggestions(parsed, lang);
+}
+
+async function _openaiAssistContinue({ text, lang }) {
+  const key = (process.env.OPENAI_API_KEY || '').trim();
+  const model = process.env.ASSIST_MODEL || 'gpt-4o-mini';
+  const timeoutMs = Number(process.env.ASSIST_TIMEOUT_MS || 12000);
+  const maxTokens = Number(process.env.ASSIST_MAX_TOKENS || 120);
+
+  if (!key) throw new Error('OPENAI_API_KEY not set');
+  console.log(`[assist] provider=openai → model=${model}, key=${key.slice(0,4)}…${key.slice(-4)}`);
+
+  const body = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You suggest 3-5 short, natural continuations/refinements of a user wish. ' +
+          'Output MUST be plain JSON array of strings in the same language. ' +
+          'No numbering, no quotes, no markdown, each <= 200 chars.',
+      },
+      {
+        role: 'user',
+        content: `lang=${lang || 'auto'}\ntext:\n${text}\nReturn ONLY JSON array of strings.`,
+      },
+    ],
+    max_tokens: maxTokens,
+    temperature: 0.7,
+  };
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`OpenAI ${resp.status}: ${txt}`);
+    }
+    const data = await resp.json();
+    const content = data.choices?.[0]?.message?.content?.trim() || '[]';
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      const m = content.match(/\[[\s\S]*\]/);
+      parsed = m ? JSON.parse(m[0]) : [];
+    }
+    return _cleanSuggestions(parsed, lang);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function _assistContinue({ text, lang }) {
+  const provider = (process.env.ASSIST_PROVIDER || 'vertex').toLowerCase();
+  try {
+    if (provider === 'vertex') return await _vertexAssistContinue({ text, lang });
+    if (provider === 'openai') return await _openaiAssistContinue({ text, lang });
+    return [`[echo:${provider}] ${text}`];
+  } catch (e) {
+    console.error(`assist provider ${provider} failed:`, e.message);
+    if (provider === 'vertex') {
+      console.warn('⚠️ Vertex failed — fallback to OpenAI');
+      try {
+        return await _openaiAssistContinue({ text, lang });
+      } catch (e2) {
+        console.error('❌ OpenAI fallback failed:', e2.message);
+        return [];
+      }
+    }
+    return [];
+  }
+}
+
+// ---------- HTTP endpoint (Assist) ----------
+app.post('/api/assist/continue', async (req, res) => {
+  try {
+    if (!ASSIST_ENABLED) {
+      return res.status(404).json({ ok: false, error: 'assist_disabled' });
+    }
+    const origin = req.headers.origin;
+    if (ASSIST_ALLOW_ORIGINS.length && origin && !ASSIST_ALLOW_ORIGINS.includes(origin)) {
+      return res.status(403).json({ ok: false, error: 'origin_forbidden' });
+    }
+
+    const { text = '', lang = 'auto', uid } = req.body || {};
+    const cleaned = he.decode(String(text || '')).trim();
+    if (!cleaned || cleaned.length < 6) {
+      return res.status(400).json({ ok: false, error: 'text_too_short' });
+    }
+
+    // Примитивный rate-limit (по uid или по IP)
+    const key = uid ? `u:${uid}` : `ip:${req.ip}`;
+    if (!_assistAllow(key, 8, 60_000)) {
+      return res.status(429).json({ ok: false, error: 'rate_limited' });
+    }
+
+    const suggestions = await _assistContinue({ text: cleaned, lang });
+    if (!suggestions || !suggestions.length) {
+      return res.status(204).end();
+    }
+    return res.json({ ok: true, suggestions });
+  } catch (e) {
+    console.error('assist/continue error:', e);
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ======= Normalization helpers =======
+async function getNormalizedText(docRef, docData) {
+  if (docData.normalized && docData.normalized.text) {
+    return docData.normalized.text;
+  }
+  await ensureNormalized(docRef, docData);
+  const updated = await docRef.get();
+  const updatedData = updated.data() || {};
+  return updatedData.normalized?.text || docData.text || '';
+}
+
+// ======= Matching logic (AI-powered) =======
+async function detectCategories(normalizedText) {
+  if (
+    EMBEDDINGS_ENABLED &&
+    translators &&
+    typeof translators.classifyText === 'function'
+  ) {
+    try {
+      const category = await translators.classifyText(normalizedText);
+      if (category) return [category];
+    } catch (error) {
+      console.warn('AI classification failed, fallback to regex:', error.message);
+    }
+  }
+
+  const t = (normalizedText || '').toLowerCase();
+  if (/(car|auto|vehicle|bmw|toyota|mercedes|tesla)/i.test(t)) return ['auto'];
+
+  const cats = [];
+  if (/(learn|study|teach|education|course)/i.test(t)) cats.push('learning');
+  if (/(friend|meet|people|social|connection)/i.test(t)) cats.push('social');
+  if (/(travel|trip|journey|adventure)/i.test(t)) cats.push('travel');
+  if (/(health|fitness|sport|exercise|yoga)/i.test(t)) cats.push('health');
+  if (/(music|art|movie|entertainment|fun)/i.test(t)) cats.push('entertainment');
+
+  return cats.length ? cats : ['general'];
+}
+
+function getMagicType(category) {
+  const magicMap = {
+    auto: 'market',
+    learning: 'knowledge',
+    social: 'connection',
+    travel: 'adventure',
+    health: 'vitality',
+    entertainment: 'fun',
+    general: 'magic',
+  };
+  return magicMap[category] || 'magic';
+}
+
+function generateMatchText(normalizedText, category) {
+  const t = (normalizedText || '').trim();
+  const key = t ? t.split(/\s+/).slice(0, 2).join(' ') : 'interest';
+  const templates = {
+    learning: `I also want to learn: ${key}`,
+    social: `Looking for company for: ${key}`,
+    travel: `Dreaming about trip: ${key}`,
+    auto: `Interested in cars: ${key}`,
+    default: `I'm also interested in: ${key}`,
+  };
+  return templates[category] || templates.default;
+}
+
+// select real counterparts for an intent with AI-powered matching
+async function selectCounterpartsForIntent(srcId, srcData, limit = EMBEDDINGS_TOP_K) {
+  console.log(`🎯 DEBUG: EMBEDDINGS_MIN_SIM = ${EMBEDDINGS_MIN_SIM}`);
+
+  // попытка антидубликата по уже созданным матчам
+  try {
+    const existing = await db.collection('matches')
+      .where('aIntentId', '==', srcId)
+      .limit(1)
+      .get();
+    if (!existing.empty) {
+      console.log(`ℹ️ Intent ${srcId} already has matches, skipping`);
+      return [];
+    }
+  } catch (e) {
+    console.warn('existing matches check warn:', e.message || e);
+  }
+
+  const srcRef = db.collection('intents').doc(srcId);
+  const text = await getNormalizedText(srcRef, srcData);
+  if (!text.trim()) {
+    console.log('ℹ️ Empty normalized text, skipping matching');
+    return [];
+  }
+
+  const me = srcData.userId;
+
+  const snap = await db.collection('intents')
+    .where('status', '==', 'published')
+    .orderBy('createdAt', 'desc')
+    .limit(EMBEDDINGS_CANDIDATE_LIMIT)
+    .get();
+
+  console.log(`🔍 Found ${snap.size} candidate intents for matching`);
+
+  const arrPromises = [];
+  const processed = new Set();
+
+  snap.forEach((d) => {
+    if (d.id === srcId) return;
+    const x = d.data() || {};
+    if (!x.userId || x.userId === me) return;
+    if (processed.has(d.id)) return;
+    processed.add(d.id);
+
+    arrPromises.push((async () => {
+      try {
+        const targetRef = db.collection('intents').doc(d.id);
+        const targetText = await getNormalizedText(targetRef, x);
+        if (!targetText.trim()) return null;
+
+        // --- Семантика — единственный критерий при включённых эмбеддингах ---
+        if (EMBEDDINGS_ENABLED) {
+          try {
+            const score = await translators.semanticSimilarity(text, targetText);
+            console.log(`🎯 similarity=${score.toFixed(3)} vs threshold=${EMBEDDINGS_MIN_SIM}`);
+            if (score >= EMBEDDINGS_MIN_SIM) {
+              return { id: d.id, ...x, score, matchType: 'semantic', semanticMatch: true };
+            }
+            return null; // ниже порога — отбрасываем
+          } catch (e) {
+            console.warn('semanticSimilarity error:', e.message || e);
+            // при реальной ошибке — можно разрешить keyword-фолбэк как редкий случай
+          }
+        }
+
+        // --- Keyword фолбэк ТОЛЬКО если эмбеддинги выключены или упали с ошибкой ---
+        const textLower = text.toLowerCase();
+        const targetLower = targetText.toLowerCase();
+
+        const MIN_KEYWORD_SCORE = 0.75;
+        let keywordScore = 0;
+
+        if (textLower && targetLower.includes(textLower)) {
+          keywordScore = 0.75;
+        } else if (textLower.includes('car') && targetLower.includes('car')) {
+          keywordScore = 0.78;
+        } else if (textLower.includes('auto') && targetLower.includes('auto')) {
+          keywordScore = 0.76;
+        }
+
+        if (keywordScore >= MIN_KEYWORD_SCORE) {
+          return { id: d.id, ...x, score: keywordScore, matchType: 'keyword', semanticMatch: false };
+        }
+        return null;
+      } catch (error) {
+        console.warn(`Error processing candidate ${d.id}:`, error.message || error);
+        return null;
+      }
+    })());
+  });
+
+  const results = (await Promise.all(arrPromises)).filter(Boolean);
+  results.sort((a, b) => b.score - a.score);
+
+  const finalResults = results.slice(0, limit);
+  console.log(`✅ Matching complete: ${finalResults.length} matches found`);
+  return finalResults;
+}
+
+// ======= Privacy-safe snapshots & push =======
+async function ensurePrivateDoc(uid, seed = {}) {
+  const now = FV.serverTimestamp();
+  const ref = db.doc(`users_private/${uid}`);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    await ref.set({
+      emailVerified: false,
+      phoneVerified: false,
+      contacts: { email: null, phone: null, telegram: null, whatsapp: null, preferred: null },
+      devices: [],
+      createdAt: now,
+      updatedAt: now,
+      ...seed,
+    }, { merge: true });
+    await db.collection('audit_events').add({
+      type: 'sign_up',
+      uid,
+      createdAt: now,
+      version: 1,
+    });
+    console.log('🧩 users_private created for', uid);
+  } else {
+    await ref.set({ updatedAt: now, ...seed }, { merge: true });
+  }
+}
+
+async function getUserSafeSnapshot(uid) {
+  const [pubSnap, privSnap] = await Promise.all([
+    db.doc(`users/${uid}`).get(),
+    db.doc(`users_private/${uid}`).get(),
+  ]);
+  const u = pubSnap.exists ? pubSnap.data() || {} : {};
+  const p = privSnap.exists ? privSnap.data() || {} : {};
+
+  const loc = u.loc || {};
+  const anchor = u.anchor || {};
+  const admin2 = (loc.district || loc.admin2 || u.admin2 || '') || null;
+  const city = (loc.city || u.city || anchor.city || '') || null;
+  const country = (u.country || loc.countryName || loc.country || anchor.country || '') || null;
+  const display = [admin2, city, country].filter(Boolean).join(' • ') || null;
+
+  return {
+    displayName: u.displayName ?? '',
+    photoURL: u.photoURL ?? null,
+    loc: { admin2, city, country, display },
+    contacts: {
+      phone: get(p, 'contacts.phone', null),
+      telegram: get(p, 'contacts.telegram', null),
+      whatsapp: get(p, 'contacts.whatsapp', null),
+      email: get(p, 'contacts.email', null),
+      preferred: get(p, 'contacts.preferred', null),
+    },
+    languages: Array.isArray(u.languages) ? u.languages.slice(0, 5) : null,
+    sharedAt: FV.serverTimestamp(),
+    version: 1,
+  };
+}
+
+// --- пуши из users_private.devices[] + чистка битых токенов
+async function sendPushToUser(uid, payload) {
+  try {
+    const priv = await db.doc(`users_private/${uid}`).get();
+    const devices = (priv.exists ? priv.get('devices') : []) || [];
+    const tokens = Array.isArray(devices)
+      ? Array.from(new Set(devices.map(d => d && d.fcmToken).filter(Boolean)))
+      : [];
+
+    if (!tokens.length) {
+      console.log('🔕 No tokens for uid', uid);
+      return;
+    }
+
+    const msg = {
+      tokens,
+      notification: payload.notification || undefined,
+      data: payload.data || {},
+    };
+    const resp = await admin.messaging().sendEachForMulticast(msg);
+    console.log(`📬 Push to ${uid}: success=${resp.successCount}, fail=${resp.failureCount}`);
+
+    const bad = [];
+    resp.responses.forEach((r, i) => {
+      if (!r.success) {
+        const code = r.error && r.error.code;
+        if (
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token'
+        ) bad.push(tokens[i]);
+      }
+    });
+
+    if (bad.length) {
+      await db.doc(`users_private/${uid}`).set({
+        devices: FV.arrayRemove(...devices.filter(d => bad.includes(d.fcmToken)))
+      }, { merge: true });
+      console.log('🧹 Removed invalid tokens:', bad.length);
+    }
+  } catch (e) {
+    console.error('❌ sendPushToUser error:', e);
+  }
+}
+
+// ----- readPublicMeta -----
+async function readPublicMeta(uid) {
+  try {
+    const snap = await db.doc(`users/${uid}`).get();
+    const u = snap.exists ? (snap.data() || {}) : {};
+    const loc = u.loc || {};
+    const anchor = u.anchor || {};
+
+    const admin2 = (loc.district || loc.admin2 || u.admin2 || '').toString();
+    const city = (loc.city || u.city || anchor.city || '').toString();
+    const country = (u.country || loc.countryName || loc.country || anchor.country || '').toString();
+
+    const parts = [];
+    if (admin2) parts.push(admin2);
+    if (city) parts.push(city);
+    if (country) parts.push(country);
+    const display = parts.filter(Boolean).join(' • ');
+
+    return {
+      text: (u.lastIntentText || '').toString(),
+      loc: {
+        admin2: admin2 || null,
+        city: city || null,
+        country: country || null,
+        lat: typeof anchor.lat === 'number' ? anchor.lat : null,
+        lng: typeof anchor.lng === 'number' ? anchor.lng : null,
+        display: display || null,
+      },
+    };
+  } catch {
+    return { text: '', loc: {} };
+  }
+}
+
+// ===============================
+// Normalization (patched)
+// ===============================
+async function ensureNormalized(wishRef, wish) {
+  const raw  = wish.text || '';
+  const text = dehtml(raw); // де-HTML
+  if (!text.trim()) return;
+
+  const already  = _.get(wish, 'normalized.text');
+  const lastSrc  = _.get(wish, 'normalized._sourceText');
+  if (already && lastSrc === raw) return;
+
+  let detected = wish.lang && wish.lang !== 'auto' ? wish.lang : null;
+  try {
+    if (!detected) detected = await translators.detectLanguage(text);
+  } catch (e) {
+    console.warn('Language detection failed, fallback to "und"', e.message);
+    detected = 'und';
+  }
+
+  let normalizedText = text;
+  let translated = false;
+  let provider = process.env.TRANSLATOR_PROVIDER || 'gct';
+  let providerMs = 0;
+
+  if ((detected || '').toLowerCase() !== 'en') {
+    try {
+      const res = await translators.translateToEn(text, detected || 'auto');
+      normalizedText = res.text || text;
+      provider = res.provider || provider;
+      providerMs = res.ms || 0;
+      translated = !res.fallback;
+    } catch (e) {
+      console.warn('Translation failed, using original text', e.message || e);
+      normalizedText = text;
+      translated = false;
+    }
+  }
+
+  await wishRef.set({
+    normalized: {
+      lang: 'en',
+      text: normalizedText,
+      detectedLang: detected || 'und',
+      translated,
+      provider,
+      providerMs,
+      _sourceText: raw,
+      updatedAt: FV.serverTimestamp(),
+    },
+  }, { merge: true });
+
+  const targets = (process.env.TARGET_LOCALES || '')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+  if (targets.length) {
+    const detectedLang = (detected || 'und').toLowerCase();
+    const srcText = raw;
+    const enText  = normalizedText;
+
+    const translations = {};
+    for (const lang of targets) {
+      try {
+        if (lang === 'en') {
+          translations['en'] = { text: enText, provider, ms: providerMs };
+          continue;
+        }
+        if (detectedLang !== 'und' && lang === detectedLang) {
+          translations[lang] = { text: srcText, provider: 'origin', ms: 0 };
+          continue;
+        }
+        const r = await translators.translate(srcText, lang, detectedLang || 'auto');
+        translations[lang] = {
+          text: r.text || srcText,
+          provider: r.provider || 'gct',
+          ms: r.ms || 0
+        };
+      } catch (e) {
+        console.warn('translate ->', lang, 'failed:', e.message || e);
+      }
+    }
+
+    if (Object.keys(translations).length) {
+      await wishRef.set({
+        normalized: {
+          translations,
+          _sourceText: srcText,
+        }
+      }, { merge: true });
+    }
+  }
+}
+
+// ======= Processing =======
+async function processGenericDoc(kind, doc) {
+  const data = doc.data() || {};
+  if (!data) return;
+
+  const textRaw = data.text || '';
+  const status = data.status;
+
+  console.log(`🔮 Processing ${kind}:`, {
+    id: doc.id,
+    status,
+    userId: data.userId || data.uid || 'unknown',
+    text: short(textRaw, 60),
+  });
+
+  await new Promise((r) => setTimeout(r, 300));
+
+  const isIntent = kind === 'INTENT';
+  const parentRef = isIntent
+    ? db.collection('intents').doc(doc.id)
+    : db.collection('wishes').doc(doc.id);
+
+  try {
+    await ensureNormalized(parentRef, data);
+  } catch (e) {
+    console.warn('normalize warn:', e.message || e);
+  }
+
+  if (isIntent) {
+    const updatedSnap = await parentRef.get();
+    const currentData = updatedSnap.data() || {};
+    const normalizedText = currentData.normalized?.text || textRaw;
+
+    const cps = await selectCounterpartsForIntent(doc.id, currentData, MATCH_TOP_N);
+
+    const batch = db.batch();
+    const createdIds = [];
+    const notifiedBUsers = [];
+
+    const metaA = await readPublicMeta(currentData.userId).catch(() => ({ loc: {}, text: '' }));
+    const pickLoc = (loc) => ({
+      admin2: loc?.admin2 ?? null,
+      city: loc?.city ?? null,
+      country: loc?.country ?? null,
+      display: loc?.display ?? null,
+    });
+
+    if (cps.length) {
+      for (const c of cps.slice(0, MATCH_TOP_N)) {
+        const pk = pairKey(currentData.userId, c.userId, doc.id, c.id);
+        const mId = pk;
+        const mRef = db.collection('matches').doc(mId);
+
+        const dup = await mRef.get();
+        if (dup.exists) continue;
+
+        const category = (await detectCategories(normalizedText))[0] || 'general';
+
+        const metaB = await readPublicMeta(c.userId).catch(() => ({ loc: {}, text: '' }));
+        const aLoc = pickLoc(metaA.loc || {});
+        const bLoc = pickLoc(metaB.loc || {});
+
+        const regionDisplay =
+          (bLoc.display && bLoc.display.trim()) ||
+          (aLoc.display && aLoc.display.trim()) ||
+          (c.regionDisplay || '') || '';
+
+        const usersArray = [currentData.userId, c.userId].filter(Boolean);
+        if (usersArray.length < 2) {
+          console.warn(`⚠️ Skipping match creation: not enough valid users (${usersArray.length})`);
+          continue;
+        }
+
+        const matchData = {
+          aUid: currentData.userId,
+          bUid: c.userId,
+          users: usersArray,
+          participants: usersArray,
+
+          aIntentId: doc.id,
+          bIntentId: c.id,
+
+          aText: (textRaw || ''),
+          bText: (c.text || ''),
+
+          aLoc,
+          bLoc,
+          regionDisplay,
+
+          aCreatedAt: currentData.createdAt || FV.serverTimestamp(),
+          bCreatedAt: c.createdAt || FV.serverTimestamp(),
+
+          matchedText: generateMatchText(normalizedText, category),
+          category,
+          magicType: getMagicType(category),
+          matchType: c.matchType || 'semantic',
+          similarity: c.score,
+          score: c.score,
+          confidence: Math.min(0.95, (c.score || 0) + 0.05),
+
+          approxDistanceKm: null,
+
+          pairKey: pk,
+          appId: 'com.magicai.box',
+          source: 'intent',
+          status: 'new',
+          createdAt: FV.serverTimestamp(),
+          updatedAt: FV.serverTimestamp(),
+        };
+
+        const batchOp = mRef.set(matchData, { merge: false });
+        batch.set = batch.set || (() => {}); // чтобы не пугаться в логике
+        await batchOp; // для надёжности создаём сразу (чтобы не гоняться за upsert в батче)
+        createdIds.push(mId);
+        notifiedBUsers.push(c.userId);
+        console.log(`✅ Creating match ${mId} between ${currentData.userId} and ${c.userId}`);
+      }
+    } else {
+      console.log('ℹ️ No real counterparts found; skipping synthetic matches');
+    }
+
+    const updOp = parentRef.set({
+      processedAt: FV.serverTimestamp(),
+      workerProcessed: true,
+      matchesCount: createdIds.length,
+      workerVersion: 'magicbox-worker-2.0',
+      workerLastRun: nowIso(),
+    }, { merge: true });
+    await updOp;
+
+    // Пуши — вне батча
+    if (createdIds.length) {
+      try {
+        const initiatorLanguage = (await getUserLanguage(currentData.userId)) || 'en';
+        const initiatorTitle = await translateIfNeeded('Match found', 'en', initiatorLanguage);
+        const initiatorBody  = await translateIfNeeded('You have a new match', 'en', initiatorLanguage);
+
+        await sendPushToUser(currentData.userId, {
+          notification: { title: initiatorTitle, body: initiatorBody },
+          data: { type: 'match_new' },
+        });
+
+        for (const bUid of notifiedBUsers) {
+          const opponentLanguage = (await getUserLanguage(bUid)) || 'en';
+          const opponentTitle = await translateIfNeeded('You were matched', 'en', opponentLanguage);
+          const opponentBody  = await translateIfNeeded('You have a new match', 'en', opponentLanguage);
+
+          await sendPushToUser(bUid, {
+            notification: { title: opponentTitle, body: opponentBody },
+            data: { type: 'match_new' },
+          });
+        }
+
+        const deliveredUids = [currentData.userId, ...notifiedBUsers];
+        await Promise.all(
+          createdIds.map((mid) =>
+            db.doc(`matches/${mid}`).set(
+              {
+                deliveredTo: FV.arrayUnion(...deliveredUids),
+                deliveredAt: FV.serverTimestamp(),
+                updatedAt: FV.serverTimestamp(),
+              },
+              { merge: true },
+            ),
+          ),
+        );
+
+        console.log(`🌐 Sent translated notifications to A (${initiatorLanguage}) and ${notifiedBUsers.length} B's`);
+      } catch (e) {
+        console.warn('push match_new warn:', e.message || e);
+      }
+    }
+
+    console.log(`✅ INTENT processed (real-only):`, { id: doc.id, matches: createdIds.length });
+    return;
+  }
+
+  // ---------- WISH (синтетика отключена) ----------
+  await parentRef.set({
+    processedAt: FV.serverTimestamp(),
+    workerProcessed: true,
+    matchesCount: 0,
+    workerVersion: 'magicbox-worker-2.0',
+    workerLastRun: nowIso(),
+  }, { merge: true });
+  console.log(`✅ WISH processed (skipped synthetic):`, { id: doc.id, matches: 0 });
+}
+
+// ===== DEACTIVATION: when intent removed/unpublished =====
+async function deactivateMatchesForIntent(intentId, reason = 'intent_removed') {
+  if (!intentId) return;
+
+  const LIMIT = 300;
+  let total = 0;
+
+  async function deactivateSide(sideField) {
+    let last = null;
+    while (true) {
+      // Без orderBy → не нужен композитный индекс (курсор по __name__)
+      let q = db.collection('matches')
+        .where(sideField, '==', intentId)
+        .limit(LIMIT);
+
+      if (last) q = q.startAfter(last);
+
+      const snap = await q.get();
+      if (snap.empty) break;
+
+      const batch = db.batch();
+      snap.docs.forEach((d) => {
+        const m = d.data() || {};
+        const a = m.aUid, b = m.bUid;
+        const closedBySide =
+          m.aIntentId === intentId ? 'a' :
+          m.bIntentId === intentId ? 'b' : null;
+        const closedByUid =
+          closedBySide === 'a' ? a :
+          closedBySide === 'b' ? b : null;
+
+        batch.set(d.ref, {
+          status: 'void',
+          closedReason: reason || 'intent_unpublished_or_deleted',
+          closedBySide,          // 'a' | 'b' | null
+          closedByUid: closedByUid || null,
+          showVoidBanner: true,  // подсказка для UI: показать баннер «Удалено оппонентом»
+          archivedAt: FV.serverTimestamp(),
+          updatedAt: FV.serverTimestamp(),
+        }, { merge: true });
+      });
+      await batch.commit();
+
+      total += snap.size;
+      last = snap.docs[snap.docs.length - 1];
+    }
+  }
+
+  // Обрабатываем обе стороны
+  await deactivateSide('aIntentId');
+  await deactivateSide('bIntentId');
+
+  console.log(`🧹 Deactivated ${total} matches for intent ${intentId} (${reason})`);
+}
+
+// ===== Watchers / Listeners =====
+function setupListener(collectionName, kind) {
+  console.log(`🔍 Setting up listener: ${collectionName} (status == 'published')`);
+
+  return db.collection(collectionName)
+    .where('status', '==', 'published')
+    .onSnapshot(
+      (snapshot) => {
+        console.log(`📡 ${collectionName} snapshot: size=${snapshot.size}, changes=${snapshot.docChanges().length}`);
+
+        snapshot.docChanges().forEach((change) => {
+          const { type, doc } = change;
+
+          // NEW: если смотрим intents с фильтром "published",
+          // событие "removed" означает удаление документа ИЛИ смену статуса на не-published
+          if (kind === 'INTENT' && type === 'removed') {
+            const id = doc.id;
+            // Не блокируем поток — деактивация идёт асинхронно
+            deactivateMatchesForIntent(id, 'intent_unpublished_or_deleted')
+              .catch(e => console.error('❌ deactivate error:', e));
+            return;
+          }
+
+          if (type === 'added' || type === 'modified') {
+            if (docWasProcessed(doc)) {
+              console.log(`⏭️ ${kind} ${doc.id} already processed, skipping`);
+              return;
+            }
+
+            const st = (doc.data() || {}).status;
+            if (st !== 'published') return;
+
+            const processKey = `${kind}_${doc.id}`;
+            if (global.processingQueue && global.processingQueue[processKey]) {
+              console.log(`⏳ ${kind} ${doc.id} is already being processed, skipping`);
+              return;
+            }
+            if (!global.processingQueue) global.processingQueue = {};
+            global.processingQueue[processKey] = true;
+
+            processGenericDoc(kind, doc)
+              .catch((e) => {
+                console.error(`❌ Error processing ${kind}:`, e);
+              })
+              .finally(() => {
+                setTimeout(() => {
+                  if (global.processingQueue) {
+                    delete global.processingQueue[processKey];
+                  }
+                }, 5000);
+              });
+          }
+        });
+      },
+      (error) => {
+        console.error(`❌ ${collectionName} listener error:`, error);
+      }
+    );
+}
+
+function setupFirestoreListeners() {
+  if (!db) {
+    console.log('❌ Firebase not available for listeners');
+    return;
+  }
+  setupListener('intents', 'INTENT');
+  setupListener('wishes', 'WISH');
+  setupUsersWatcher();
+  setupIntentsLanguageWatcher();
+  setupContactRequestsWatcher();
+  console.log('✅ Firestore listeners active: INTENTS, WISHES, USERS, INTENTS_LANGUAGE, CONTACT_REQUESTS');
+}
+
+// === INTENTS watcher для определения языка ===
+function setupIntentsLanguageWatcher() {
+  console.log('💬 Setting up INTENTS watcher for language detection');
+
+  return db.collection('intents').onSnapshot(
+    (snapshot) => {
+      snapshot.docChanges().forEach(async (change) => {
+        if (change.type !== 'added') return; // простая версия
+
+        const doc = change.doc;
+        const data = doc.data() || {};
+        const uid = data.userId; // userId, не uid
+        const intentText = data.text;
+        const status = data.status;
+
+        if (status === 'published') {
+          return;
+        }
+
+        if (!uid || !intentText) return;
+
+        try {
+          console.log(`🔍 New intent for language detection: "${short(intentText, 50)}"`);
+          const detected = await translators.detectLanguage(intentText);
+          if (detected && detected !== 'und') {
+            const privRef = db.collection('users_private').doc(uid);
+            await privRef.set({
+              preferences: {
+                interfaceLanguage: detected,
+                autoTranslate: true,
+                detectedAt: FV.serverTimestamp(),
+                detectedFrom: 'intent'
+              },
+              updatedAt: FV.serverTimestamp()
+            }, { merge: true });
+
+            await db.collection('users').doc(uid).set({
+              lastIntentText: intentText,
+              updatedAt: FV.serverTimestamp()
+            }, { merge: true });
+
+            console.log(`🌐 Updated user ${uid} language to: ${detected} (from intent)`);
+          }
+        } catch (e) {
+          console.error('❌ INTENTS watcher language update failed:', e);
+        }
+      });
+    },
+    (error) => {
+      console.error('❌ INTENTS watcher error:', error);
+    }
+  );
+}
+
+// === USERS watcher ===
+function setupUsersWatcher() {
+  console.log('👤 Setting up USERS watcher');
+
+  return db.collection('users').onSnapshot(
+    (snapshot) => {
+      snapshot.docChanges().forEach(async (change) => {
+        const doc = change.doc;
+        const uid = doc.id;
+        const data = doc.data() || {};
+        if (!uid) return;
+
+        try {
+          const privRef = db.collection('users_private').doc(uid);
+          const privSnap = await privRef.get();
+          const isNew = !privSnap.exists;
+
+          const serverNow = FV.serverTimestamp();
+          const now = TS.now();
+
+          const batch = db.batch();
+
+          const base = {
+            lastSeenAt: serverNow,
+            updatedAt: serverNow,
+          };
+          if (isNew) {
+            base.createdAt = serverNow;
+            base.firstSeenAt = serverNow;
+          }
+          batch.set(privRef, base, { merge: true });
+
+          const tokens = Array.isArray(data.fcmTokens) ? data.fcmTokens.filter(Boolean) : [];
+          const platform =
+            Array.isArray(data.platforms) && data.platforms.length
+              ? data.platforms[0]
+              : (data.platform || 'unknown');
+
+          if (tokens.length) {
+            const deviceObjs = tokens.map((t) => ({
+              platform,
+              fcmToken: t,
+              firstSeenAt: now,
+              updatedAt: now,
+            }));
+
+            batch.set(privRef, { devices: FV.arrayUnion(...deviceObjs) }, { merge: true });
+          }
+
+          await batch.commit();
+          console.log(`✅ User ${uid} ${isNew ? 'created' : 'updated'} in users_private`);
+
+        } catch (e) {
+          console.error('❌ USERS watcher upsert users_private failed:', e);
+        }
+      });
+    },
+    (error) => {
+      console.error('❌ USERS watcher error:', error);
+    }
+  );
+}
+
+// === CONTACT_REQUESTS watcher → write contact_snapshot + push
+function setupContactRequestsWatcher() {
+  console.log('🤝 Setting up CONTACT_REQUESTS watcher');
+  return db.collection('contact_requests').onSnapshot(async (snap) => {
+    for (const ch of snap.docChanges()) {
+      if (ch.type === 'added') {
+        const after = ch.doc.data() || {};
+        const status = after.status;
+        const fromUid = after.fromUid || after.requesterId;
+        const toUid   = after.toUid   || after.recipientId;
+        const matchId = after.matchId;
+
+        if (status === 'pending' && toUid && matchId) {
+          try {
+            await sendPushToUser(toUid, {
+              notification: { title: 'Запрос контакта', body: 'Пользователь запросил ваши контакты' },
+              data: { type: 'contact_request_new', matchId, requestId: ch.doc.id },
+            });
+
+            await db.doc(`matches/${matchId}`).set({
+              deliveredTo: FV.arrayUnion(toUid),
+              updatedAt: FV.serverTimestamp(),
+            }, { merge: true });
+          } catch (e) {
+            console.warn('contact_request pending push warn:', e.message || e);
+          }
+        }
+        continue;
+      }
+
+      if (ch.type !== 'modified') continue;
+
+      const after = ch.doc.data() || {};
+      const before = ch.oldIndex >= 0 ? snap.docs[ch.oldIndex]?.data() : null;
+      if (!before || before.status === after.status) continue;
+
+      const status = after.status;
+      const fromUid = after.requesterId || after.fromUid;
+      const toUid = after.recipientId || after.toUid;
+      const matchId = after.matchId;
+      if (!fromUid || !toUid || !matchId) continue;
+
+      if (status === 'accepted') {
+        try {
+          const safe = await getUserSafeSnapshot(toUid);
+
+          const mRef = db.doc(`matches/${matchId}`);
+          const mSnap = await mRef.get();
+          if (!mSnap.exists) {
+            console.warn('⚠️ match not found for contact acceptance', matchId);
+          } else {
+            const m = mSnap.data() || {};
+            let pathKey = null;
+            if (m.aUid && m.bUid) {
+              pathKey = toUid === m.aUid ? 'contact_snapshot.a'
+                   : toUid === m.bUid ? 'contact_snapshot.b'
+                   : null;
+            } else {
+              pathKey = 'contact_snapshot.receiver';
+            }
+
+            if (pathKey) {
+              await mRef.set({
+                [pathKey]: safe,
+                contactsExchanged: true,
+                [`contactAcceptedFor.${fromUid}`]: true,
+                [`contactAcceptedFor.${toUid}`]: true,
+                updatedAt: FV.serverTimestamp(),
+              }, { merge: true });
+            }
+          }
+
+          await sendPushToUser(fromUid, {
+            notification: { title: 'Контакт доступен', body: 'Пользователь поделился контактами' },
+            data: { type: 'contact_request_accepted', matchId, requestId: ch.doc.id },
+          });
+
+          await db.collection('audit_events').add({
+            type: 'contact_share',
+            uid: toUid,
+            counterpartUid: fromUid,
+            matchId,
+            snapshot: { shared: Object.keys(safe.contacts || {}).filter((k) => safe.contacts[k]) },
+            createdAt: FV.serverTimestamp(),
+            version: 1,
+          });
+
+          console.log('✅ contact accepted → snapshot written & push sent', { matchId, requestId: ch.doc.id });
+        } catch (e) {
+          console.error('❌ contact acceptance handling error', e);
+        }
+      }
+
+      if (status === 'declined') {
+        await sendPushToUser(fromUid, {
+          notification: { title: 'Запрос отклонён', body: 'Контакты не были предоставлены' },
+          data: { type: 'contact_request_declined', matchId, requestId: ch.doc.id },
+        });
+        console.log('ℹ️ contact declined → push sent', { matchId, requestId: ch.doc.id });
+      }
+    }
+  }, (err) => console.error('❌ CONTACT_REQUESTS watcher error:', err));
+}
+
+// ======= HTTP =======
+app.get('/', (req, res) => {
+  res.json({
+    message: '🔮 Magic Worker',
+    status: 'running',
+    firebase: firebaseLoaded ? 'connected' : 'not connected',
+    features: [
+      'intents listener',
+      'wishes listener',
+      'real matching (no synthetic)',
+      'users_private bootstrap',
+      'contact_requests → contact_snapshot',
+      'FCM push',
+      'audit events',
+      'normalization before matching',
+      'deactivation on intent removal/unpublish',
+    ],
+    endpoints: [
+      'GET /',
+      'POST /api/wish         (test: create INTENT with status=published)',
+      'POST /api/publish-wish (test: create WISH   with status=published)',
+      'GET /api/stats',
+      'GET /api/debug-env',
+      'POST /api/assist/continue',
+    ],
+  });
+});
+
+// Разовый бэкфилл
+app.post('/admin/backfill-matches', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '300', 10), 1000);
+    const snap = await db.collection('matches')
+      .orderBy('createdAt', 'desc')
+      .limit(limit)
+      .get();
+
+    let updated = 0;
+    for (const doc of snap.docs) {
+      const m = doc.data() || {};
+      const aUid = m.aUid || m.aUserId;
+      const bUid = m.bUid || m.bUserId;
+      const aIntentId = m.aIntentId;
+      const bIntentId = m.bIntentId;
+
+      if (!aUid || !bUid) continue;
+
+      const upd = {};
+
+      if (!m.aText && aIntentId) {
+        const aInt = await db.doc(`intents/${aIntentId}`).get();
+        if (aInt.exists) upd.aText = (aInt.data().text || '');
+      }
+      if (!m.bText && bIntentId) {
+        const bInt = await db.doc(`intents/${bIntentId}`).get();
+        if (bInt.exists) upd.bText = (bInt.data().text || '');
+      }
+
+      if (!Array.isArray(m.users) || m.users.length !== 2) {
+        upd.users = [aUid, bUid];
+      }
+
+      if (!m.aCreatedAt && aIntentId) {
+        const aInt = await db.doc(`intents/${aIntentId}`).get();
+        if (aInt.exists) upd.aCreatedAt = aInt.data().createdAt || aInt.createTime?.toDate() || new Date();
+      }
+      if (!m.bCreatedAt && bIntentId) {
+        const bInt = await db.doc(`intents/${bIntentId}`).get();
+        if (bInt.exists) upd.bCreatedAt = bInt.data().createdAt || bInt.createTime?.toDate() || new Date();
+      }
+
+      if (!m.aLoc || !m.bLoc || !m.regionDisplay) {
+        const [metaA, metaB] = await Promise.all([
+          readPublicMeta(aUid).catch(() => ({ loc: {} })),
+          readPublicMeta(bUid).catch(() => ({ loc: {} })),
+        ]);
+        if (!m.aLoc) upd.aLoc = metaA.loc || null;
+        if (!m.bLoc) upd.bLoc = metaB.loc || null;
+        if (!m.regionDisplay) {
+          upd.regionDisplay = (metaB.loc && metaB.loc.display) ||
+                              (metaA.loc && metaA.loc.display) || '';
+        }
+      }
+
+      if (Object.keys(upd).length) {
+        upd.updatedAt = FV.serverTimestamp();
+        await doc.ref.set(upd, { merge: true });
+        updated++;
+      }
+    }
+
+    res.json({ ok: true, scanned: snap.size, updated });
+  } catch (e) {
+    console.error('backfill error', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Test: create INTENT (status=published)
+app.post('/api/wish', async (req, res) => {
+  try {
+    const { text, userId, userName = 'Magic User' } = req.body || {};
+    const id = `test_${Date.now()}`;
+
+    console.log('🎯 Received TEST /api/wish (INTENT):', { id, text: short(text), userId });
+
+    if (!firebaseLoaded || !db) {
+      return res.json({
+        success: true,
+        message: '✨ Received (mock mode — no Firebase)',
+        wishId: id,
+        mode: 'mock',
+      });
+    }
+
+    const data = {
+      text: text || '',
+      userId: userId || 'test_user',
+      userName,
+      type: 'want',
+      category: 'товары',
+      radiusKm: 25,
+      status: 'published',
+      createdAt: new Date(),
+    };
+
+    const ref = db.collection('intents').doc(id);
+    await ref.set(data);
+
+    return res.json({
+      success: true,
+      message: '✨ INTENT created; listener will process it.',
+      intentId: id,
+      mode: 'firebase_intents',
+    });
+  } catch (error) {
+    console.error('❌ /api/wish error:', error);
+    res.status(500).json({ success: false, error: String(error.message || error) });
+  }
+});
+
+// Test: create WISH (status=published)
+app.post('/api/publish-wish', async (req, res) => {
+  try {
+    const { text, uid, scope = 'country' } = req.body || {};
+    const id = `wish_${Date.now()}`;
+
+    console.log('🎯 Received TEST /api/publish-wish (WISH):', { id, text: short(text), uid });
+
+    if (!firebaseLoaded || !db) {
+      return res.json({
+        success: true,
+        message: '✨ Received (mock mode — no Firebase)',
+        wishId: id,
+        mode: 'mock',
+      });
+    }
+
+    const data = {
+      text: text || '',
+      uid: uid || 'test_user',
+      status: 'published',
+      scope,
+      createdAt: new Date(),
+    };
+
+    const ref = db.collection('wishes').doc(id);
+    await ref.set(data);
+
+    return res.json({
+      success: true,
+      message: '✨ WISH created; listener will process it.',
+      wishId: id,
+      mode: 'firebase_wishes',
+    });
+  } catch (error) {
+    console.error('❌ /api/publish-wish error:', error);
+    res.status(500).json({ success: false, error: String(error.message || error) });
+  }
+});
+
+app.get('/api/stats', (req, res) => {
+  res.json({
+    success: true,
+    stats: {
+      firebase: firebaseLoaded,
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      timestamp: nowIso(),
+    },
+  });
+});
+
+app.get('/api/debug-env', (req, res) => {
+  res.json({
+    project_id: process.env.project_id,
+    client_email: process.env.client_email,
+    private_key_exists: !!process.env.private_key,
+    translator_provider: (process.env.TRANSLATOR_PROVIDER || 'gct').toLowerCase(),
+    firebase_loaded: firebaseLoaded,
+  });
+});
+
+// --- Translation routes ---
+app.get('/api/translator', (req, res) => {
+  res.json({
+    provider: (process.env.TRANSLATOR_PROVIDER || 'gct').toLowerCase(),
+    using: 'worker/translators/index.js',
+  });
+});
+
+app.post('/api/detect', async (req, res) => {
+  try {
+    const { text = '' } = req.body || {};
+    if (!translators || typeof translators.detectLanguage !== 'function') {
+      return res.status(500).json({ ok: false, error: 'detectLanguage not available' });
+    }
+    const lang = await translators.detectLanguage(text);
+    res.json({ ok: true, lang });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.post('/api/translate', async (req, res) => {
+  try {
+    const { text = '', from = 'auto' } = req.body || {};
+    if (!translators || typeof translators.translateToEn !== 'function') {
+      return res.status(500).json({ ok: false, error: 'translateToEn not available' });
+    }
+    const result = await translators.translateToEn(text, from);
+    const out = typeof result === 'string' ? { text: result, provider: 'unknown', ms: 0 } : result;
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+const PORT = process.env.API_PORT || 3000;
+
+// Главная async функция для запуска
+async function startServer() {
+  try {
+    if (!firebaseLoaded) {
+      console.log('⏳ Waiting for Firebase initialization...');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`
+🎉 MAGIC WORKER STARTED! 🎉
+
+📍 http://localhost:${PORT}
+🔧 Firebase: ${firebaseLoaded ? '✅ CONNECTED' : '❌ NOT CONNECTED'}
+👂 Listeners: INTENTS (real-only), WISHES, USERS, CONTACT_REQUESTS
+✨ Ready for Flutter app integration
+
+Try:
+  curl http://localhost:${PORT}/
+  curl -X POST http://localhost:${PORT}/api/wish -H "Content-Type: application/json" -d '{"text":"машина","userId":"u1"}'
+  curl -X POST http://localhost:${PORT}/api/publish-wish -H "Content-Type: application/json" -d '{"text":"Хочу купить ноутбук","uid":"u2"}'
+      `);
+
+      if (firebaseLoaded) {
+        setupFirestoreListeners();
+        console.log('✅ Firestore listeners activated');
+      } else {
+        console.log('⚠️ Firebase not loaded - listeners disabled');
+      }
+    });
+
+    const gracefulShutdown = () => {
+      console.log('🔄 Received shutdown signal, closing gracefully...');
+      server.close(() => {
+        console.log('✅ Server closed');
+        process.exit(0);
+      });
+      setTimeout(() => {
+        console.log('❌ Forcing shutdown');
+        process.exit(1);
+      }, 10000);
+    };
+
+    process.on('SIGINT', gracefulShutdown);
+    process.on('SIGTERM', gracefulShutdown);
+
+    app.get('/health', (req, res) => {
+      res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        firebase: firebaseLoaded,
+        uptime: process.uptime(),
+      });
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// --- Embeddings debug routes ---
+app.get('/api/embeddings/status', (req, res) => {
+  res.json({
+    enabled: process.env.EMBEDDINGS_ENABLED === 'true',
+    provider: (process.env.EMBEDDINGS_PROVIDER || 'vertex').toLowerCase(),
+    project: process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null,
+    location: process.env.VERTEX_LOCATION || 'us-central1',
+    minSim: parseFloat(process.env.EMBEDDINGS_MIN_SIM || '0.80'),
+    topK: parseInt(process.env.EMBEDDINGS_TOP_K || '5', 10),
+  });
+});
+
+app.post('/api/embeddings/embed', async (req, res) => {
+  try {
+    const { text = '' } = req.body || {};
+    const v = await translators.getEmbedding(text);
+    res.json({ ok: true, dim: v.length, preview: v.slice(0, 8) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.post('/api/embeddings/similarity', async (req, res) => {
+  try {
+    const { a = '', b = '' } = req.body || {};
+    const sim = await translators.semanticSimilarity(a, b);
+    res.json({ ok: true, similarity: sim });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Запускаем сервер
+(async () => {
+  try {
+    await startServer();
+  } catch (error) {
+    console.error('❌ Failed to start application:', error);
+    process.exit(1);
+  }
+})();
+
+// ====== NOTE ======
+// Ветка WISH оставлена без синтетических матчей.
+// Если потребуется — добавь свою реализацию generateMatches()
+// и вызов в processGenericDoc для kind !== 'INTENT'.

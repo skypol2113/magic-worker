@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # Redis кластер для геораспределенности
+  redis-master:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_master_data:/data
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
+    deploy:
+      replicas: 1
+
+  redis-replica:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --replicaof redis-master 6379 --requirepass ${REDIS_PASSWORD} --masterauth ${REDIS_PASSWORD}
+    depends_on:
+      - redis-master
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: always
+
+  # PostgreSQL с репликацией
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # Основной воркер
+  wish-matcher-worker:
+    build: .
+    environment:
+      - NODE_ENV=production
+      - REGION=${REGION}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379
+      - POSTGRES_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - WORKER_CONCURRENCY=10
+      - LOG_LEVEL=info
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./ml/models:/app/ml/models
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: always
+    deploy:
+      replicas: 3
+
+  # Воркер для специфичных регионов
+  wish-matcher-worker-asia:
+    build: .
+    environment:
+      - NODE_ENV=production
+      - REGION=asia
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379
+      - POSTGRES_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - WORKER_CONCURRENCY=8
+      - PREFERRED_LANGUAGES=ru,kk,zh,en
+    depends_on:
+      - redis-master
+      - postgres
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+
+  # Cron контейнер для восстановительных задач
+  wish-matcher-cron:
+    build: .
+    command: ["node", "cron/recovery.js"]
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis-master:6379
+    depends_on:
+      - redis-master
+    volumes:
+      - ./logs:/app/logs
+    restart: always
+    profiles:
+      - cron
+
+  # Мониторинг
+  monitoring:
+    image: grafana/grafana:10.0.0
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: always
+
+volumes:
+  redis_master_data:
+  postgres_data:
+  grafana_data:

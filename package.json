@@ -1,0 +1,63 @@
+{
+  "name": "magicbox-worker",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "description": "AI-powered wish matching worker for Magic Box App",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "dev:debug": "nodemon --inspect index.js",
+    "test": "jest --coverage --passWithNoTests",
+    "test:watch": "jest --watch",
+    "test:ci": "jest --coverage --ci",
+    "lint": "eslint . --ext .js --ignore-pattern node_modules/",
+    "lint:fix": "eslint . --ext .js --ignore-pattern node_modules/ --fix",
+    "audit": "npm audit --audit-level moderate",
+    "audit:fix": "npm audit fix",
+    "docker:build": "docker build -t magicbox-worker .",
+    "docker:run": "docker run -d --env-file .env --name magicbox-worker -p 3000:3000 magicbox-worker",
+    "docker:compose": "docker-compose -f docker-compose.prod.yml up -d",
+    "docker:logs": "docker logs -f magicbox-worker",
+    "docker:clean": "docker system prune -f",
+    "healthcheck": "curl -f http://localhost:3000/health || exit 1"
+  },
+  "dependencies": {
+    "@bull-board/api": "^5.20.1",
+    "@bull-board/express": "^5.20.1",
+    "@bull-board/ui": "^5.20.1",
+    "@google-cloud/translate": "^8.5.1",
+    "@google-cloud/vertexai": "^1.10.0",
+    "axios": "^1.6.0",
+    "bull": "^4.11.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^13.5.0",
+    "google-auth-library": "^10.4.1",
+    "he": "^1.2.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.3.2",
+    "lodash": "^4.17.21",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-import": "^2.29.1",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1",
+    "supertest": "^6.3.4"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "keywords": [
+    "ai",
+    "matching",
+    "firebase",
+    "vertex-ai",
+    "worker"
+  ]
+}
