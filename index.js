@@ -258,18 +258,16 @@ async function _openaiAssistContinue({ text, lang }) {
       {
         role: 'system',
         content:
-          'You are an AI writing assistant helping users refine their wish/offer text for MagicAIbox platform. ' +
-          'Given user input, provide 3-5 alternative phrasings that express THE EXACT SAME wish more clearly. ' +
-          'Rules: ' +
-          '1. PRESERVE intent direction: "want to sell X" stays "selling X", "want to learn Y" stays "learning Y", "can help with Z" stays "helping with Z". ' +
-          '2. Only rephrase for clarity, add helpful details, or improve grammar. ' +
-          '3. Each variant must include semantic facets/tags (e.g., "продажа", "обучение", "техника"). ' +
-          'Output JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
-          'Language must match input.',
+          'You help users rephrase their wish/offer for clarity. You ONLY rephrase, never change the meaning. ' +
+          'If input is "want to SELL X" → output "selling X" or "offering X for sale". ' +
+          'If input is "want to LEARN Y" → output "learning Y" or "studying Y". ' +
+          'If input is "can TEACH Z" → output "teaching Z" or "helping learn Z". ' +
+          'NEVER suggest opposite actions (don\'t turn "sell" into "buy", or "learn" into "teach"). ' +
+          'Output JSON: {"suggestions":[{"text":"rephrased same wish","facets":["tag1","tag2"]},...]}.',
       },
       {
         role: 'user',
-        content: `User wrote: "${text}"\nLanguage: ${lang || 'auto'}\n\nProvide 3-5 rephrased versions (same meaning, better wording) as JSON.`,
+        content: `Rephrase this (keep exact same wish): "${text}"\nLanguage: ${lang || 'auto'}`,
       },
     ],
     max_tokens: ASSIST_MAX_TOKENS + 50,
@@ -355,7 +353,7 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-    const cacheKey = _hash(`v6|${lang}|${cleaned}`);
+    const cacheKey = _hash(`v7|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
