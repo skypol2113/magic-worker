@@ -259,14 +259,16 @@ async function _openaiAssistContinue({ text, lang }) {
         role: 'system',
         content:
           'You are an AI assistant for MagicAIbox, a platform where people share wishes and offers. ' +
-          'Given a user wish/offer, suggest 3-5 improved variations of THE SAME type (if selling→keep selling, if buying→keep buying, if offering help→keep offering). ' +
-          'Each suggestion must include: (1) refined text (<=200 chars), (2) semantic facets/tags (e.g., "learning", "teaching", "exchange", "music", "travel"). ' +
+          'Given a user wish/offer, suggest 3-5 improved variations of THE SAME type and direction. ' +
+          'CRITICAL: If user wants to SELL something, all suggestions must be about SELLING. If user wants to BUY, all must be about BUYING. ' +
+          'If user wants to TEACH, keep TEACHING. If user wants to LEARN, keep LEARNING. ' +
+          'Each suggestion must include: (1) refined text (<=200 chars), (2) semantic facets/tags. ' +
           'Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
-          'Language must match input. No markdown, no extra text. PRESERVE the original intent type.',
+          'Language must match input. No markdown.',
       },
       {
         role: 'user',
-        content: `Language: ${lang || 'auto'}\nUser wish:\n"${text}"\n\nProvide JSON with suggestions array.`,
+        content: `Example: "I want to sell my bike" → suggestions must all be about SELLING bikes.\nExample: "I want to learn French" → all about LEARNING French.\n\nNow process:\nLanguage: ${lang || 'auto'}\nUser wish: "${text}"\n\nProvide JSON with suggestions array.`,
       },
     ],
     max_tokens: ASSIST_MAX_TOKENS + 50, // больше для facets
@@ -352,7 +354,7 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-    const cacheKey = _hash(`v4|${lang}|${cleaned}`);
+    const cacheKey = _hash(`v5|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
