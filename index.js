@@ -79,18 +79,27 @@ function _normalizeLangCode(lang) {
   return code;
 }
 
+// Format RTL punctuation for Arabic (add space before ? and ! if missing)
+function _formatRTL(text, lang) {
+  if (lang !== 'ar') return text;
+  // Add space before ? and ! if not already present
+  return text.replace(/([^\s])([?!])/g, '$1 $2');
+}
+
 // Translate field key to user language (with fallback to Google Translate)
 async function _translateFieldLabel(fieldKey, targetLang) {
   const lang = _normalizeLangCode(targetLang);
   // Check dictionary first
-  if (FIELD_LABELS[fieldKey]?.[lang]) return FIELD_LABELS[fieldKey][lang];
+  if (FIELD_LABELS[fieldKey]?.[lang]) {
+    return _formatRTL(FIELD_LABELS[fieldKey][lang], lang);
+  }
   // Fallback: use English label or key itself
   const fallback = FIELD_LABELS[fieldKey]?.en || fieldKey;
   // If target is not English and we have translators, try Google Translate
   if (lang !== 'en' && translators?.translateText) {
     try {
       const translated = await translators.translateText(fallback, 'en', lang);
-      if (translated) return translated;
+      if (translated) return _formatRTL(translated, lang);
     } catch (e) {
       // ignore, return fallback
     }
