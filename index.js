@@ -23,6 +23,85 @@ const ASSIST_FACETS_MAX = parseInt(process.env.ASSIST_FACETS_MAX || '8', 10);
 const ASSIST_MISSING_MAX = parseInt(process.env.ASSIST_MISSING_MAX || '4', 10);
 const ASSIST_RECOMMENDED_MAX = parseInt(process.env.ASSIST_RECOMMENDED_MAX || '3', 10);
 
+// ---------- Field Label Translations (for missingFields/recommendedFields) ----------
+const FIELD_LABELS = {
+  // Core fields (universal)
+  price: { en: 'Price?', ru: 'Цена?', zh: '价格?', es: '¿Precio?', ar: 'السعر؟' },
+  location: { en: 'Location?', ru: 'Место?', zh: '地点?', es: '¿Ubicación?', ar: 'الموقع؟' },
+  date: { en: 'Date?', ru: 'Дата?', zh: '日期?', es: '¿Fecha?', ar: 'التاريخ؟' },
+  time: { en: 'Time?', ru: 'Время?', zh: '时间?', es: '¿Hora?', ar: 'الوقت؟' },
+  duration: { en: 'How many days?', ru: 'Сколько дней?', zh: '多少天?', es: '¿Cuántos días?', ar: 'كم يوما؟' },
+  // People/capacity
+  peopleCount: { en: 'How many people?', ru: 'Сколько человек?', zh: '多少人?', es: '¿Cuántas personas?', ar: 'كم شخص؟' },
+  seats: { en: 'Seats?', ru: 'Мест?', zh: '座位?', es: '¿Asientos?', ar: 'المقاعد؟' },
+  capacity: { en: 'Capacity?', ru: 'Вместимость?', zh: '容量?', es: '¿Capacidad?', ar: 'السعة؟' },
+  // Budget/money
+  budget: { en: 'Budget?', ru: 'Бюджет?', zh: '预算?', es: '¿Presupuesto?', ar: 'الميزانية؟' },
+  pricePerHour: { en: 'Price/hour?', ru: 'Цена/час?', zh: '每小时价格?', es: '¿Precio/hora?', ar: 'السعر/ساعة؟' },
+  currency: { en: 'Currency?', ru: 'Валюта?', zh: '货币?', es: '¿Moneda?', ar: 'العملة؟' },
+  // Item condition/specs
+  condition: { en: 'Condition?', ru: 'Состояние?', zh: '状况?', es: '¿Estado?', ar: 'الحالة؟' },
+  brand: { en: 'Brand?', ru: 'Бренд?', zh: '品牌?', es: '¿Marca?', ar: 'العلامة التجارية؟' },
+  year: { en: 'Year?', ru: 'Год?', zh: '年份?', es: '¿Año?', ar: 'السنة؟' },
+  model: { en: 'Model?', ru: 'Модель?', zh: '型号?', es: '¿Modelo?', ar: 'الطراز؟' },
+  size: { en: 'Size?', ru: 'Размер?', zh: '尺寸?', es: '¿Tamaño?', ar: 'الحجم؟' },
+  color: { en: 'Color?', ru: 'Цвет?', zh: '颜色?', es: '¿Color?', ar: 'اللون؟' },
+  // Learning/teaching
+  schedule: { en: 'Schedule?', ru: 'Расписание?', zh: '时间表?', es: '¿Horario?', ar: 'الجدول الزمني؟' },
+  level: { en: 'Level?', ru: 'Уровень?', zh: '水平?', es: '¿Nivel?', ar: 'المستوى؟' },
+  subject: { en: 'Subject?', ru: 'Предмет?', zh: '科目?', es: '¿Materia?', ar: 'الموضوع؟' },
+  language: { en: 'Language?', ru: 'Язык?', zh: '语言?', es: '¿Idioma?', ar: 'اللغة؟' },
+  // Travel/rideshare
+  from: { en: 'From?', ru: 'Откуда?', zh: '从哪里?', es: '¿Desde?', ar: 'من أين؟' },
+  to: { en: 'To?', ru: 'Куда?', zh: '到哪里?', es: '¿Hasta?', ar: 'إلى أين؟' },
+  vehicle: { en: 'Vehicle?', ru: 'Транспорт?', zh: '车辆?', es: '¿Vehículo?', ar: 'المركبة؟' },
+  luggageAllowed: { en: 'Luggage?', ru: 'Багаж?', zh: '行李?', es: '¿Equipaje?', ar: 'الأمتعة؟' },
+  // Housing
+  rooms: { en: 'Rooms?', ru: 'Комнат?', zh: '房间数?', es: '¿Habitaciones?', ar: 'الغرف؟' },
+  area: { en: 'Area?', ru: 'Площадь?', zh: '面积?', es: '¿Área?', ar: 'المساحة؟' },
+  // Tech/specs
+  ram: { en: 'RAM?', ru: 'ОЗУ?', zh: '内存?', es: '¿RAM?', ar: 'الذاكرة العشوائية؟' },
+  storage: { en: 'Storage?', ru: 'Память?', zh: '存储?', es: '¿Almacenamiento?', ar: 'التخزين؟' },
+  // Service/event
+  availability: { en: 'When available?', ru: 'Когда доступно?', zh: '何时可用?', es: '¿Cuándo disponible?', ar: 'متى متاح؟' },
+  contact: { en: 'Contact?', ru: 'Контакт?', zh: '联系方式?', es: '¿Contacto?', ar: 'جهة الاتصال؟' },
+};
+
+// Normalize lang code to 2-letter (zh-CN → zh, etc.)
+function _normalizeLangCode(lang) {
+  if (!lang) return 'en';
+  const code = String(lang).toLowerCase().split('-')[0].slice(0, 2);
+  // Map common aliases
+  if (code === 'cn') return 'zh';
+  return code;
+}
+
+// Translate field key to user language (with fallback to Google Translate)
+async function _translateFieldLabel(fieldKey, targetLang) {
+  const lang = _normalizeLangCode(targetLang);
+  // Check dictionary first
+  if (FIELD_LABELS[fieldKey]?.[lang]) return FIELD_LABELS[fieldKey][lang];
+  // Fallback: use English label or key itself
+  const fallback = FIELD_LABELS[fieldKey]?.en || fieldKey;
+  // If target is not English and we have translators, try Google Translate
+  if (lang !== 'en' && translators?.translateText) {
+    try {
+      const translated = await translators.translateText(fallback, 'en', lang);
+      if (translated) return translated;
+    } catch (e) {
+      // ignore, return fallback
+    }
+  }
+  return fallback;
+}
+
+// Translate array of field keys
+async function _translateFieldArray(fields, targetLang) {
+  if (!Array.isArray(fields) || !fields.length) return [];
+  const promises = fields.map(f => _translateFieldLabel(f, targetLang));
+  return Promise.all(promises);
+}
+
 // ---------- Embeddings ----------
 const EMBEDDINGS_ENABLED = (process.env.EMBEDDINGS_ENABLED || 'true') === 'true';
 const EMBEDDINGS_MIN_SIM = parseFloat(process.env.EMBEDDINGS_MIN_SIM || '0.75');
@@ -415,9 +494,24 @@ async function _assistHandler(req, res) {
     const items = await _openaiAssistContinue({ text: cleaned, lang });
     if (!Array.isArray(items) || !items.length) return res.status(204).end();
 
-    _cacheSet(cacheKey, items);
+      // Translate missingFields & recommendedFields to user's language
+      const translatedItems = await Promise.all(
+        items.map(async (item) => {
+          const [translatedMissing, translatedRecommended] = await Promise.all([
+            _translateFieldArray(item.missingFields, lang),
+            _translateFieldArray(item.recommendedFields, lang),
+          ]);
+          return {
+            ...item,
+            missingFieldsLabels: translatedMissing,
+            recommendedFieldsLabels: translatedRecommended,
+          };
+        })
+      );
+
+      _cacheSet(cacheKey, translatedItems);
     console.log(`💡 [${req._rid}] assist ${items.length} in ${Date.now() - t0}ms`);
-    return res.json({ ok: true, items, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
+      return res.json({ ok: true, items: translatedItems, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
   } catch (e) {
     const msg = e?.message || String(e);
     const isAbort = /aborted|AbortError|The operation was aborted/i.test(msg);
