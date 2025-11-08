@@ -25,6 +25,25 @@ const EMBEDDINGS_MIN_SIM = parseFloat(process.env.EMBEDDINGS_MIN_SIM || '0.75');
 const EMBEDDINGS_CANDIDATE_LIMIT = parseInt(process.env.EMBEDDINGS_CANDIDATE_LIMIT || '200', 10);
 const EMBEDDINGS_TOP_K = parseInt(process.env.EMBEDDINGS_TOP_K || '5', 10);
 
+// ---------- God-Mode & Limits ----------
+const APP_MODE = process.env.APP_MODE || 'production';
+const MAX_ACTIVE_INTENTS = parseInt(process.env.MAX_ACTIVE_INTENTS_PER_USER || '10', 10);
+const INTENT_COOLDOWN_MS = parseInt(process.env.INTENT_PUBLISH_COOLDOWN_SEC || '60', 10) * 1000;
+
+// Cooldown tracking (in-memory, resets on restart)
+const _intentPublishCooldowns = new Map();
+
+function checkIntentCooldown(uid) {
+  const last = _intentPublishCooldowns.get(uid);
+  if (!last) return true;
+  const elapsed = Date.now() - last;
+  return elapsed >= INTENT_COOLDOWN_MS;
+}
+
+function setIntentCooldown(uid) {
+  _intentPublishCooldowns.set(uid, Date.now());
+}
+
 // ---------- Firebase ----------
 const FV = admin.firestore.FieldValue;
 const TS = admin.firestore.Timestamp;
@@ -239,16 +258,18 @@ async function _openaiAssistContinue({ text, lang }) {
       {
         role: 'system',
         content:
-          'You suggest 3-5 short, natural continuations/refinements of a user wish. ' +
-          'Output MUST be a JSON array of strings in the same language. ' +
-          'No numbering, no quotes, no markdown, each <= 200 chars.',
+          'You are an AI assistant for MagicAIbox, a platform where people share wishes and offers. ' +
+          'Given a user wish/offer, suggest 3-5 improved variations. ' +
+          'Each suggestion must include: (1) refined text (<=200 chars), (2) semantic facets/tags (e.g., "learning", "teaching", "exchange", "music", "travel"). ' +
+          'Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
+          'Language must match input. No markdown, no extra text.',
       },
       {
         role: 'user',
-        content: `lang=${lang || 'auto'}\ntext:\n${text}\nReturn ONLY JSON array of strings.`,
+        content: `Language: ${lang || 'auto'}\nUser wish:\n"${text}"\n\nProvide JSON with suggestions array.`,
       },
     ],
-    max_tokens: ASSIST_MAX_TOKENS,
+    max_tokens: ASSIST_MAX_TOKENS + 50, // больше для facets
     temperature: 0.7,
     n: 1,
     response_format: { type: 'json_object' },
@@ -268,16 +289,26 @@ async function _openaiAssistContinue({ text, lang }) {
       throw new Error(`OpenAI ${resp.status}: ${txt}`);
     }
     const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content?.trim() || '[]';
+    const content = data.choices?.[0]?.message?.content?.trim() || '{"suggestions":[]}';
+    
     let parsed;
     try {
       parsed = JSON.parse(content);
     } catch {
-      const m = content.match(/\[[\s\S]*\]/);
-      parsed = m ? JSON.parse(m[0]) : [];
+      // Fallback: попытка извлечь JSON из текста
+      const m = content.match(/\{[\s\S]*"suggestions"[\s\S]*\}/);
+      parsed = m ? JSON.parse(m[0]) : { suggestions: [] };
     }
-    const arr = Array.isArray(parsed?.suggestions) ? parsed.suggestions : Array.isArray(parsed) ? parsed : [];
-    return _cleanSuggestions(arr);
+    
+    const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
+    
+    // Нормализация: если пришёл массив строк, оборачиваем в объекты
+    const normalized = suggestions.map(s => {
+      if (typeof s === 'string') return { text: s, facets: [] };
+      return { text: s.text || '', facets: Array.isArray(s.facets) ? s.facets : [] };
+    });
+
+    return normalized.filter(s => s.text.length >= 10);
   } finally {
     clearTimeout(t);
   }
@@ -315,16 +346,16 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-    const cacheKey = _hash(`v2|${lang}|${cleaned}`);
+    const cacheKey = _hash(`v3|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
-    if (cached) return res.json({ ok: true, suggestions: cached, cached: true, ms: Date.now() - t0 });
+    if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
-    const suggestions = await _openaiAssistContinue({ text: cleaned, lang });
-    if (!Array.isArray(suggestions) || !suggestions.length) return res.status(204).end();
+    const items = await _openaiAssistContinue({ text: cleaned, lang });
+    if (!Array.isArray(items) || !items.length) return res.status(204).end();
 
-    _cacheSet(cacheKey, suggestions);
-    console.log(`💡 [${req._rid}] assist ${suggestions.length} in ${Date.now() - t0}ms`);
-    return res.json({ ok: true, suggestions, ms: Date.now() - t0 });
+    _cacheSet(cacheKey, items);
+    console.log(`💡 [${req._rid}] assist ${items.length} in ${Date.now() - t0}ms`);
+    return res.json({ ok: true, items, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
   } catch (e) {
     const msg = e?.message || String(e);
     const isAbort = /aborted|AbortError|The operation was aborted/i.test(msg);
@@ -1177,6 +1208,37 @@ app.get('/', (req, res) => {
 app.post('/api/wish', async (req, res) => {
   try {
     const { text, userId, userName = 'Magic User' } = req.body || {};
+    const uid = userId || 'test_user';
+
+    // Проверка cooldown
+    if (!checkIntentCooldown(uid)) {
+      const remaining = Math.ceil((INTENT_COOLDOWN_MS - (Date.now() - _intentPublishCooldowns.get(uid))) / 1000);
+      return res.status(429).json({ 
+        success: false, 
+        error: 'cooldown_active',
+        message: `Please wait ${remaining} seconds before publishing another intent`,
+        remainingSeconds: remaining
+      });
+    }
+
+    // Проверка лимита активных интентов
+    if (firebaseLoaded && db) {
+      const activeSnap = await db.collection('intents')
+        .where('userId', '==', uid)
+        .where('status', '==', 'published')
+        .get();
+      
+      if (activeSnap.size >= MAX_ACTIVE_INTENTS) {
+        return res.status(429).json({
+          success: false,
+          error: 'too_many_intents',
+          message: `You have reached the limit of ${MAX_ACTIVE_INTENTS} active intents. Please complete or archive some first.`,
+          activeCount: activeSnap.size,
+          maxAllowed: MAX_ACTIVE_INTENTS
+        });
+      }
+    }
+
     const id = `test_${Date.now()}`;
 
     if (!firebaseLoaded || !db) {
@@ -1185,7 +1247,7 @@ app.post('/api/wish', async (req, res) => {
 
     const data = {
       text: text || '',
-      userId: userId || 'test_user',
+      userId: uid,
       userName,
       type: 'want',
       status: 'published',
@@ -1193,7 +1255,15 @@ app.post('/api/wish', async (req, res) => {
     };
 
     await db.collection('intents').doc(id).set(data);
-    return res.json({ success: true, message: 'INTENT created; listener will process it', intentId: id, mode: 'firebase_intents' });
+    setIntentCooldown(uid);
+    
+    return res.json({ 
+      success: true, 
+      message: 'INTENT created; listener will process it', 
+      intentId: id, 
+      mode: 'firebase_intents',
+      godMode: APP_MODE === 'god'
+    });
   } catch (e) {
     console.error('/api/wish error:', e);
     res.status(500).json({ success: false, error: String(e.message || e) });
@@ -1226,6 +1296,90 @@ app.post('/api/publish-wish', async (req, res) => {
 
 // Assist: continue/refine wish text (UI taps the ✨)
 app.post('/api/assist/continue', _assistHandler);
+
+// User stats for UI indicators (limits, cooldown, god-mode)
+app.get('/api/user/stats', async (req, res) => {
+  try {
+    const uid = req.query.uid;
+    if (!uid) return res.status(400).json({ ok: false, error: 'uid_required' });
+
+    if (!firebaseLoaded || !db) {
+      return res.json({ ok: true, activeIntents: 0, maxIntents: MAX_ACTIVE_INTENTS, godMode: APP_MODE === 'god', cooldownRemaining: 0 });
+    }
+
+    const activeSnap = await db.collection('intents')
+      .where('userId', '==', uid)
+      .where('status', '==', 'published')
+      .get();
+
+    const lastPublish = _intentPublishCooldowns.get(uid);
+    const cooldownRemaining = lastPublish 
+      ? Math.max(0, Math.ceil((INTENT_COOLDOWN_MS - (Date.now() - lastPublish)) / 1000))
+      : 0;
+
+    return res.json({
+      ok: true,
+      activeIntents: activeSnap.size,
+      maxIntents: MAX_ACTIVE_INTENTS,
+      cooldownRemaining,
+      godMode: APP_MODE === 'god',
+      limits: {
+        intents: `${activeSnap.size}/${MAX_ACTIVE_INTENTS}`,
+        nextPublishIn: cooldownRemaining > 0 ? `${cooldownRemaining}s` : 'available'
+      }
+    });
+  } catch (e) {
+    console.error('/api/user/stats error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Match translation endpoint with caching
+app.post('/api/match/translate', async (req, res) => {
+  try {
+    const { matchId, targetLang = 'en', field = 'bText' } = req.body || {};
+    
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId_required' });
+    if (!firebaseLoaded || !db) return res.status(503).json({ ok: false, error: 'firebase_unavailable' });
+
+    const mRef = db.collection('matches').doc(matchId);
+    const mSnap = await mRef.get();
+    
+    if (!mSnap.exists) return res.status(404).json({ ok: false, error: 'match_not_found' });
+
+    const match = mSnap.data() || {};
+    const textToTranslate = match[field] || '';
+    
+    if (!textToTranslate) {
+      return res.status(400).json({ ok: false, error: 'text_empty' });
+    }
+
+    // Check cache
+    const cached = match.translations?.[field]?.[targetLang];
+    
+    if (cached) {
+      return res.json({ ok: true, translated: cached, cached: true, targetLang });
+    }
+
+    // Translate
+    const translated = await translators.translate(textToTranslate, targetLang);
+    
+    // Save to cache
+    await mRef.set({
+      translations: {
+        [field]: {
+          [targetLang]: translated
+        }
+      },
+      updatedAt: FV.serverTimestamp()
+    }, { merge: true });
+
+    return res.json({ ok: true, translated, cached: false, targetLang });
+  } catch (e) {
+    console.error('/api/match/translate error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 // ===== Assist feedback (self-learning) =====
 app.post('/api/assist/feedback', async (req, res) => {
