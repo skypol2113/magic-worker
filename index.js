@@ -294,10 +294,16 @@ async function _openaiAssistContinue({ text, lang }) {
     let parsed;
     try {
       parsed = JSON.parse(content);
-    } catch {
+    } catch (parseErr) {
+      console.error('OpenAI JSON parse error:', parseErr.message, '| content preview:', content.slice(0, 200));
       // Fallback: попытка извлечь JSON из текста
-      const m = content.match(/\{[\s\S]*"suggestions"[\s\S]*\}/);
-      parsed = m ? JSON.parse(m[0]) : { suggestions: [] };
+      try {
+        const m = content.match(/\{[\s\S]*"suggestions"[\s\S]*\}/);
+        parsed = m ? JSON.parse(m[0]) : { suggestions: [] };
+      } catch (fallbackErr) {
+        console.error('Fallback JSON parse also failed:', fallbackErr.message);
+        return [];
+      }
     }
     
     const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
