@@ -258,20 +258,21 @@ async function _openaiAssistContinue({ text, lang }) {
       {
         role: 'system',
         content:
-          'You are an AI assistant for MagicAIbox, a platform where people share wishes and offers. ' +
-          'Given a user wish/offer, suggest 3-5 improved variations of THE SAME type and direction. ' +
-          'CRITICAL: If user wants to SELL something, all suggestions must be about SELLING. If user wants to BUY, all must be about BUYING. ' +
-          'If user wants to TEACH, keep TEACHING. If user wants to LEARN, keep LEARNING. ' +
-          'Each suggestion must include: (1) refined text (<=200 chars), (2) semantic facets/tags. ' +
-          'Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
-          'Language must match input. No markdown.',
+          'You are an AI writing assistant helping users refine their wish/offer text for MagicAIbox platform. ' +
+          'Given user input, provide 3-5 alternative phrasings that express THE EXACT SAME wish more clearly. ' +
+          'Rules: ' +
+          '1. PRESERVE intent direction: "want to sell X" stays "selling X", "want to learn Y" stays "learning Y", "can help with Z" stays "helping with Z". ' +
+          '2. Only rephrase for clarity, add helpful details, or improve grammar. ' +
+          '3. Each variant must include semantic facets/tags (e.g., "продажа", "обучение", "техника"). ' +
+          'Output JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
+          'Language must match input.',
       },
       {
         role: 'user',
-        content: `Example: "I want to sell my bike" → suggestions must all be about SELLING bikes.\nExample: "I want to learn French" → all about LEARNING French.\n\nNow process:\nLanguage: ${lang || 'auto'}\nUser wish: "${text}"\n\nProvide JSON with suggestions array.`,
+        content: `User wrote: "${text}"\nLanguage: ${lang || 'auto'}\n\nProvide 3-5 rephrased versions (same meaning, better wording) as JSON.`,
       },
     ],
-    max_tokens: ASSIST_MAX_TOKENS + 50, // больше для facets
+    max_tokens: ASSIST_MAX_TOKENS + 50,
     temperature: 0.7,
     n: 1,
     response_format: { type: 'json_object' },
@@ -354,7 +355,7 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-    const cacheKey = _hash(`v5|${lang}|${cleaned}`);
+    const cacheKey = _hash(`v6|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
