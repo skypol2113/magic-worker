@@ -260,39 +260,34 @@ async function _openaiAssistContinue({ text, lang }) {
     messages: [
       {
         role: 'system',
-        content: `
-          You are an Intent Formulator for MagicAIbox. Your job is to preserve the user's intent and enrich it with clarifying details so that a counterpart has fewer questions.
-          CRITICAL: Preserve the original direction/type. If SELL → keep SELL; if BUY → keep BUY; if LEARN → keep LEARN; if TEACH → keep TEACH; if RIDESHARE OFFER → keep OFFER; if RIDESHARE SEEK → keep SEEK. Never invert meaning.
-          Detect a category and direction, add semantic facets, and propose structured attributes relevant to that category.
-          Categories: market, rideshare, learning, teaching, service, housing, job, event, other.
-          Direction (per category): market: sell|buy; rideshare: offer|seek; learning/teaching: learn|teach; service: offer|seek; housing: offer|seek; job: offer|seek.
-
-          Number of suggestions rule: Normally output EXACTLY 1 suggestion. Output up to 3 ONLY if the user phrase genuinely supports multiple DISTINCT semantic interpretations (e.g., ambiguous meaning or different category/direction). Do not fabricate variations; each extra suggestion must represent a different plausible meaning.
-
-          Do NOT output multiple suggestions that only differ by minor adjectives (e.g., only color/size/condition). Prefer a single best enriched formulation. Put such specifics into attributes (e.g., {color:"красный"}) or leave null if unknown.
-
-          Think like the likely counterpart who will respond to this intent. Provide 5-7 KEY clarifying questions (not more!) that counterpart would ask. Each question: {key, label, required (boolean), type? (text|number|select|boolean|date), options?, hint?}. Focus on essential fields only; skip cosmetic-only questions.
-
-          Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["..."],"category":"...","direction":"...","attributes":{...},"questions":[{key,label,required,type?,options?,hint?}],"template":"...","example":"..."}, ...]}.
-          Attributes per category (only include relevant keys):
-          market: {brand,model,condition,year,color,size,quantity,price,currency,location,delivery,warranty};
-          rideshare: {route:{from,to},date,time,seats,vehicle:{make,model,year},amenities};
-          learning/teaching: {subject,level,language,modality,location,schedule,pricePerHour,currency};
-          service: {serviceType,area,availability,price,currency}; housing: {location,rooms,size,price,currency,furnished}; job: {role,location,salary,currency,schedule}.
-          If a detail is unknown, omit it or use null. Add a helpful "template" string that a user can copy and edit; for unknowns, put bracketed hints like [укажите дату]. Provide "example" — a plausible filled-in text based on the intent.
-
-          Examples:
-          Input: "хочу продать горный велосипед" → keep SELL: category=market,direction=sell; facets: ["горный велосипед"]; questions: [{key:"frameSize",label:"Размер рамы",required:true,type:"select",options:["S","M","L","XL"]}, {key:"condition",label:"Состояние",required:true,type:"select",options:["новый","отличное","хорошее","требует ремонта"]}, {key:"price",label:"Цена",required:true,type:"number"}]; template: "Размер рамы, Состояние, Цена, Город"; example: "Продаю горный велосипед Trek X-Caliber 8, размер рамы M, в отличном состоянии, 35000 руб., Москва".
-          Input: "ищу попутчика Москва → Казань завтра" → rideshare, direction=seek; questions: [{key:"date",label:"Дата",required:true,type:"date"},{key:"time",label:"Время",required:true,type:"text"},{key:"seats",label:"Мест",required:true,type:"number"}]; example: "Ищу попутчика Москва → Казань, выезд завтра 9 ноября в 8:00, есть 2 места, делим расходы пополам".
-        `
+        content: `You are an Intent Completeness Analyzer for MagicAIbox.
+        TASK: Preserve original direction/type (sell/buy/offer/seek/learn/teach). Never invert. Identify which key semantic fields are ALREADY IMPLIED and which are MISSING but HIGH-VALUE to make the intent actionable.
+        Core domains: market, rideshare, learning, teaching, service, housing, job, event, other.
+        Typical field buckets (pick relevant only): time, date, place/location, duration, price, currency, quantity, condition/state, quality/spec, capacity/seats, route(from,to), schedule, modality(online/offline), role, subject, level, size/dimensions.
+        OUTPUT RULES:
+        1) Always return EXACTLY 1 suggestion object unless genuine ambiguity (then up to 2-3 max).
+        2) Each suggestion object MUST have: text, category, direction, facets[], attributes{}, missingFields[], recommendedFields[].
+        3) missingFields: array of field keys NOT present but strongly expected for clarity (e.g., ['price','location']).
+        4) recommendedFields: optional enrichers that add precision but are not strictly mandatory (e.g., ['condition','brand']).
+        5) Keep arrays short (<=8 total between missing + recommended). Order: most critical first.
+        6) facets: short semantic tags actually present or confidently inferable.
+        7) attributes: only the fields confidently present (or directly stated). Do NOT hallucinate values; use null if uncertain.
+        8) NO verbose prose, NO questions list, NO example template in this mode.
+        STRICT JSON ONLY -> {"suggestions":[{"text":"...","category":"market|rideshare|learning|teaching|service|housing|job|event|other","direction":"sell|buy|offer|seek|learn|teach","facets":["..."],"attributes":{...},"missingFields":["..."],"recommendedFields":["..."]}]}
+        If nothing is missing, missingFields = []. Do not invent irrelevant fields.
+        Example minimal:
+        Input: "продам ноутбук" -> missingFields:['price','condition','location'], recommendedFields:['year','brand','ram','storage'].
+        Input: "ищу попутчика Москва Казань завтра утром" -> missingFields:['seats'], recommendedFields:['vehicle','luggageAllowed'].
+        Input: "учу гитаре онлайн" -> direction=teach; missingFields:['schedule','pricePerHour'], recommendedFields:['level','language'].
+        Be concise.`
       },
       {
         role: 'user',
-        content: `Language: ${lang || 'auto'}\nUser intent: "${text}"\n\nReturn ONLY JSON with suggestions as specified. Preserve intent type and add attributes/facets/template. Include questions[] (5-10 clarifying questions with key/label/required/type/options/hint) and example (a plausible filled-in text). Respect the 1-or-up-to-3 variants rule.`,
+        content: `Language: ${lang || 'auto'}\nRaw intent: "${text}"\nReturn ONLY JSON with suggestions[]. Include missingFields & recommendedFields. No questions, no examples.`,
       },
     ],
-    max_tokens: ASSIST_MAX_TOKENS + 200,
-    temperature: 0.7,
+  max_tokens: 600,
+  temperature: 0.4,
     n: 1,
     response_format: { type: 'json_object' },
   };
@@ -330,27 +325,17 @@ async function _openaiAssistContinue({ text, lang }) {
     
     const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
     
-    // Нормализация: поддержать расширенную структуру (category, direction, attributes, questions, template, example)
+    // Нормализация: поддержать расширенную структуру (category, direction, attributes, facets, missing/recommended)
     const normalized = suggestions.map(s => {
-      if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, questions: [], template: null, example: null };
+      if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, missingFields: [], recommendedFields: [] };
       return {
         text: s.text || '',
-        facets: Array.isArray(s.facets) ? s.facets : [],
+        facets: Array.isArray(s.facets) ? s.facets.slice(0, 12).map(x => String(x)) : [],
         category: typeof s.category === 'string' ? s.category : null,
         direction: typeof s.direction === 'string' ? s.direction : null,
         attributes: s && typeof s.attributes === 'object' && !Array.isArray(s.attributes) && s.attributes ? s.attributes : {},
-        questions: Array.isArray(s.questions)
-          ? s.questions.filter(q => q && typeof q === 'object').slice(0, 12).map(q => ({
-              key: typeof q.key === 'string' ? q.key : null,
-              label: typeof q.label === 'string' ? q.label : null,
-              required: typeof q.required === 'boolean' ? q.required : false,
-              type: typeof q.type === 'string' ? q.type : null,
-              options: Array.isArray(q.options) ? q.options.slice(0, 20).map(x => String(x)) : undefined,
-              hint: typeof q.hint === 'string' ? q.hint : undefined,
-            }))
-          : [],
-        template: typeof s.template === 'string' ? s.template : null,
-        example: typeof s.example === 'string' ? s.example : null,
+        missingFields: Array.isArray(s.missingFields) ? s.missingFields.slice(0, 8).map(x => String(x)) : [],
+        recommendedFields: Array.isArray(s.recommendedFields) ? s.recommendedFields.slice(0, 8).map(x => String(x)) : [],
       };
     });
 
@@ -418,8 +403,8 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-  // bump cache version due to prompt & variant logic change + questions/example
-  const cacheKey = _hash(`v11|${lang}|${cleaned}`);
+  // bump cache version due to completeness analyzer mode (missing/recommended fields)
+  const cacheKey = _hash(`v12|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
