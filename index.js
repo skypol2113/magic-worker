@@ -259,10 +259,10 @@ async function _openaiAssistContinue({ text, lang }) {
         role: 'system',
         content:
           'You are an AI assistant for MagicAIbox, a platform where people share wishes and offers. ' +
-          'Given a user wish/offer, suggest 3-5 improved variations. ' +
+          'Given a user wish/offer, suggest 3-5 improved variations of THE SAME type (if selling→keep selling, if buying→keep buying, if offering help→keep offering). ' +
           'Each suggestion must include: (1) refined text (<=200 chars), (2) semantic facets/tags (e.g., "learning", "teaching", "exchange", "music", "travel"). ' +
           'Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["...","..."]},...]}. ' +
-          'Language must match input. No markdown, no extra text.',
+          'Language must match input. No markdown, no extra text. PRESERVE the original intent type.',
       },
       {
         role: 'user',
