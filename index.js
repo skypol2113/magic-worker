@@ -16,8 +16,8 @@ const ASSIST_ALLOW_ORIGINS = (process.env.ASSIST_ALLOW_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const ASSIST_MODEL = process.env.ASSIST_MODEL || 'gpt-4o-mini';
-const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '500', 10);
-const ASSIST_TIMEOUT_MS = parseInt(process.env.ASSIST_TIMEOUT_MS || '15000', 10);
+const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '800', 10);
+const ASSIST_TIMEOUT_MS = parseInt(process.env.ASSIST_TIMEOUT_MS || '18000', 10);
 
 // ---------- Embeddings ----------
 const EMBEDDINGS_ENABLED = (process.env.EMBEDDINGS_ENABLED || 'true') === 'true';
@@ -269,22 +269,21 @@ async function _openaiAssistContinue({ text, lang }) {
 
           Number of suggestions rule: Normally output EXACTLY 1 suggestion. Output up to 3 ONLY if the user phrase genuinely supports multiple DISTINCT semantic interpretations (e.g., ambiguous meaning or different category/direction). Do not fabricate variations; each extra suggestion must represent a different plausible meaning.
 
-          Do NOT output multiple suggestions that only differ by minor adjectives (e.g., only color/size/condition). Prefer a single best enriched formulation. Put such specifics into attributes (e.g., {color:"красный"}) or leave null if unknown. If there are several possible values (e.g., красный/зеленый), list them as options inside attributes (e.g., {color:["красный","зеленый"]}) — do NOT create separate suggestions for each.
+          Do NOT output multiple suggestions that only differ by minor adjectives (e.g., only color/size/condition). Prefer a single best enriched formulation. Put such specifics into attributes (e.g., {color:"красный"}) or leave null if unknown.
 
-          Be domain-smart with facets. For bicycles, recognize types and tech details: type (горный|шоссейный|городской|BMX|гибрид), frameSize, wheelSize, brakeType (дисковые|ободные; гидравлические|механические), suspension (hardtail|full|rigid), drivetrain, condition, mileage, color, price, currency, location, delivery. Reflect key aspects as facets (e.g., "горный велосипед", "дисковые тормоза") and as attributes where structured values are appropriate. If the phrase implies "горный", you may infer typical aspects (e.g., усиленная рама/тормоза) as facets — but keep unknowns in attributes as null or hints in template.
+          Think like the likely counterpart who will respond to this intent. Provide 5-7 KEY clarifying questions (not more!) that counterpart would ask. Each question: {key, label, required (boolean), type? (text|number|select|boolean|date), options?, hint?}. Focus on essential fields only; skip cosmetic-only questions.
 
-          Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["..."],"category":"market|rideshare|learning|teaching|service|housing|job|event|other","direction":"sell|buy|offer|seek|learn|teach","attributes":{...},"template":"..."}, ...]}.
+          Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["..."],"category":"...","direction":"...","attributes":{...},"questions":[{key,label,required,type?,options?,hint?}],"template":"...","example":"..."}, ...]}.
           Attributes per category (only include relevant keys):
           market: {brand,model,condition,year,color,size,quantity,price,currency,location,delivery,warranty};
-          rideshare: {route:{from,to},date,time,seats,vehicle:{make,model,year},amenities:["AC","heater","orthopedicSeats"],luggageAllowed:boolean};
+          rideshare: {route:{from,to},date,time,seats,vehicle:{make,model,year},amenities};
           learning/teaching: {subject,level,language,modality,location,schedule,pricePerHour,currency};
           service: {serviceType,area,availability,price,currency}; housing: {location,rooms,size,price,currency,furnished}; job: {role,location,salary,currency,schedule}.
-          If a detail is unknown, omit it or use null. Add a helpful "template" string that a user can copy and edit; for unknowns, put bracketed hints like [укажите дату].
+          If a detail is unknown, omit it or use null. Add a helpful "template" string that a user can copy and edit; for unknowns, put bracketed hints like [укажите дату]. Provide "example" — a plausible filled-in text based on the intent.
 
           Examples:
-          Input: "хочу продать горный велосипед" → keep SELL: category=market,direction=sell; facets may include: "горный велосипед", "дисковые тормоза"; attributes: {brand?, model?, condition?, frameSize?, wheelSize?, brakeType?, suspension?, color?, price?, currency?, location?}; template includes: Тип/особенности, Размер рамы, Диаметр колес, Тормоза, Подвеска, Состояние, Цвет, Цена, Город.
-          Input: "ищу попутчика Москва → Казань завтра" → rideshare, direction=seek; add route.from, route.to, date, time, seats?, vehicle?, amenities?; template includes: Маршрут, Дата/время, Места, Авто, Опции.
-          Input: "могу учить гитаре онлайн" → teaching, direction=teach; add subject, modality=online, schedule, pricePerHour.
+          Input: "хочу продать горный велосипед" → keep SELL: category=market,direction=sell; facets: ["горный велосипед"]; questions: [{key:"frameSize",label:"Размер рамы",required:true,type:"select",options:["S","M","L","XL"]}, {key:"condition",label:"Состояние",required:true,type:"select",options:["новый","отличное","хорошее","требует ремонта"]}, {key:"price",label:"Цена",required:true,type:"number"}]; template: "Размер рамы, Состояние, Цена, Город"; example: "Продаю горный велосипед Trek X-Caliber 8, размер рамы M, в отличном состоянии, 35000 руб., Москва".
+          Input: "ищу попутчика Москва → Казань завтра" → rideshare, direction=seek; questions: [{key:"date",label:"Дата",required:true,type:"date"},{key:"time",label:"Время",required:true,type:"text"},{key:"seats",label:"Мест",required:true,type:"number"}]; example: "Ищу попутчика Москва → Казань, выезд завтра 9 ноября в 8:00, есть 2 места, делим расходы пополам".
         `
       },
       {
@@ -420,7 +419,7 @@ async function _assistHandler(req, res) {
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
   // bump cache version due to prompt & variant logic change + questions/example
-  const cacheKey = _hash(`v10|${lang}|${cleaned}`);
+  const cacheKey = _hash(`v11|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
