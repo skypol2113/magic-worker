@@ -16,7 +16,7 @@ const ASSIST_ALLOW_ORIGINS = (process.env.ASSIST_ALLOW_ORIGINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const ASSIST_MODEL = process.env.ASSIST_MODEL || 'gpt-4o-mini';
-const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '300', 10);
+const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '500', 10);
 const ASSIST_TIMEOUT_MS = parseInt(process.env.ASSIST_TIMEOUT_MS || '15000', 10);
 
 // ---------- Embeddings ----------
@@ -292,7 +292,7 @@ async function _openaiAssistContinue({ text, lang }) {
         content: `Language: ${lang || 'auto'}\nUser intent: "${text}"\n\nReturn ONLY JSON with suggestions as specified. Preserve intent type and add attributes/facets/template. Include questions[] (5-10 clarifying questions with key/label/required/type/options/hint) and example (a plausible filled-in text). Respect the 1-or-up-to-3 variants rule.`,
       },
     ],
-    max_tokens: ASSIST_MAX_TOKENS + 100,
+    max_tokens: ASSIST_MAX_TOKENS + 150,
     temperature: 0.7,
     n: 1,
     response_format: { type: 'json_object' },
