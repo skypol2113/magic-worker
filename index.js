@@ -18,6 +18,10 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 const ASSIST_MODEL = process.env.ASSIST_MODEL || 'gpt-4o-mini';
 const ASSIST_MAX_TOKENS = parseInt(process.env.ASSIST_MAX_TOKENS || '1100', 10);
 const ASSIST_TIMEOUT_MS = parseInt(process.env.ASSIST_TIMEOUT_MS || '20000', 10);
+// Caps for analyzer output (env-configurable)
+const ASSIST_FACETS_MAX = parseInt(process.env.ASSIST_FACETS_MAX || '8', 10);
+const ASSIST_MISSING_MAX = parseInt(process.env.ASSIST_MISSING_MAX || '4', 10);
+const ASSIST_RECOMMENDED_MAX = parseInt(process.env.ASSIST_RECOMMENDED_MAX || '3', 10);
 
 // ---------- Embeddings ----------
 const EMBEDDINGS_ENABLED = (process.env.EMBEDDINGS_ENABLED || 'true') === 'true';
@@ -330,12 +334,12 @@ async function _openaiAssistContinue({ text, lang }) {
       if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, missingFields: [], recommendedFields: [] };
       return {
         text: s.text || '',
-        facets: Array.isArray(s.facets) ? s.facets.slice(0, 12).map(x => String(x)) : [],
+  facets: Array.isArray(s.facets) ? s.facets.slice(0, ASSIST_FACETS_MAX).map(x => String(x)) : [],
         category: typeof s.category === 'string' ? s.category : null,
         direction: typeof s.direction === 'string' ? s.direction : null,
         attributes: s && typeof s.attributes === 'object' && !Array.isArray(s.attributes) && s.attributes ? s.attributes : {},
-        missingFields: Array.isArray(s.missingFields) ? s.missingFields.slice(0, 8).map(x => String(x)) : [],
-        recommendedFields: Array.isArray(s.recommendedFields) ? s.recommendedFields.slice(0, 8).map(x => String(x)) : [],
+  missingFields: Array.isArray(s.missingFields) ? s.missingFields.slice(0, ASSIST_MISSING_MAX).map(x => String(x)) : [],
+  recommendedFields: Array.isArray(s.recommendedFields) ? s.recommendedFields.slice(0, ASSIST_RECOMMENDED_MAX).map(x => String(x)) : [],
       };
     });
 
@@ -403,8 +407,8 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-  // bump cache version due to completeness analyzer mode (missing/recommended fields)
-  const cacheKey = _hash(`v12|${lang}|${cleaned}`);
+  // bump cache version: v13 (env-based caps for facets/missing/recommended)
+  const cacheKey = _hash(`v13|${lang}|${cleaned}|${ASSIST_FACETS_MAX}|${ASSIST_MISSING_MAX}|${ASSIST_RECOMMENDED_MAX}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
@@ -436,6 +440,11 @@ function buildHealthPayload() {
     assistEnabled: ASSIST_ENABLED,
     hasOpenAIKey: !!OPENAI_API_KEY,
     assistModel: ASSIST_MODEL,
+    assistCaps: {
+      facetsMax: ASSIST_FACETS_MAX,
+      missingMax: ASSIST_MISSING_MAX,
+      recommendedMax: ASSIST_RECOMMENDED_MAX,
+    },
     embeddings: {
       enabled: EMBEDDINGS_ENABLED,
       minSim: EMBEDDINGS_MIN_SIM,
