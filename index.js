@@ -71,37 +71,40 @@ async function resolveProjectIdOnce() {
 
 (function initFirebase() {
   try {
-    // 1) Если есть локальный модуль конфигурации — используем его и выходим
+    // 1) Попытка загрузить локальную конфигурацию (если есть ./config/firebase.js)
+    let firebaseDb = null;
     try {
-      const { db: firebaseDb } = require('./config/firebase');
-      if (firebaseDb && typeof firebaseDb.collection === 'function') {
-        db = firebaseDb;
-        firebaseLoaded = true;
-        global.firestore = db;
-        console.log('✅ Firebase via ./config/firebase');
-        return;
+      const firebaseConfig = require('./config/firebase');
+      if (firebaseConfig) {
+        if (firebaseConfig.db) firebaseDb = firebaseConfig.db;
+        else if (firebaseConfig.default && firebaseConfig.default.db) firebaseDb = firebaseConfig.default.db;
       }
     } catch (_) {
-      // no-op → пойдём по стандартной инициализации ниже
+      // ignore, будем инициализировать обычным способом
+    }
+    if (firebaseDb && typeof firebaseDb.collection === 'function') {
+      db = firebaseDb;
+      firebaseLoaded = true;
+      global.firestore = db;
+      console.log('✅ Firebase via ./config/firebase');
+      return;
     }
 
     // 2) ADC предпочтительнее, если работаем в GCP/Cloud Run или задан путь к JSON ключу
     const preferADC =
-      !!process.env.GOOGLE_APPLICATION_CREDENTIALS || // локально/в Docker через монтирование ключа
-      !!process.env.K_SERVICE ||                      // Cloud Run признак
-      !!process.env.GOOGLE_CLOUD_PROJECT;             // любая среда GCP
+      !!process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+      !!process.env.K_SERVICE ||
+      !!process.env.GOOGLE_CLOUD_PROJECT;
 
     if (!admin.apps.length) {
       if (preferADC) {
-        admin.initializeApp({
-          credential: admin.credential.applicationDefault(),
-        });
+        admin.initializeApp({ credential: admin.credential.applicationDefault() });
         console.log('✅ Firebase via ADC (applicationDefault)');
       } else {
         // 3) Fallback: cert(...) из переменных окружения
         const pk = String(process.env.private_key || '')
-          .replace(/\\n/g, '\n')        // распространённый случай с \n в env
-          .replace(/`n/g, '\n');        // на всякий случай для PowerShell
+          .replace(/\\n/g, '\n')
+          .replace(/`n/g, '\n');
         admin.initializeApp({
           credential: admin.credential.cert({
             project_id: process.env.project_id,
@@ -257,17 +260,36 @@ async function _openaiAssistContinue({ text, lang }) {
     messages: [
       {
         role: 'system',
-        content:
-          'You help users rephrase their wish/offer for clarity. You ONLY rephrase, never change the meaning. ' +
-          'If input is "want to SELL X" → output "selling X" or "offering X for sale". ' +
-          'If input is "want to LEARN Y" → output "learning Y" or "studying Y". ' +
-          'If input is "can TEACH Z" → output "teaching Z" or "helping learn Z". ' +
-          'NEVER suggest opposite actions (don\'t turn "sell" into "buy", or "learn" into "teach"). ' +
-          'Output JSON: {"suggestions":[{"text":"rephrased same wish","facets":["tag1","tag2"]},...]}.',
+        content: `
+          You are an Intent Formulator for MagicAIbox. Your job is to preserve the user's intent and enrich it with clarifying details so that a counterpart has fewer questions.
+          CRITICAL: Preserve the original direction/type. If SELL → keep SELL; if BUY → keep BUY; if LEARN → keep LEARN; if TEACH → keep TEACH; if RIDESHARE OFFER → keep OFFER; if RIDESHARE SEEK → keep SEEK. Never invert meaning.
+          Detect a category and direction, add semantic facets, and propose structured attributes relevant to that category.
+          Categories: market, rideshare, learning, teaching, service, housing, job, event, other.
+          Direction (per category): market: sell|buy; rideshare: offer|seek; learning/teaching: learn|teach; service: offer|seek; housing: offer|seek; job: offer|seek.
+
+          Number of suggestions rule: Normally output EXACTLY 1 suggestion. Output up to 3 ONLY if the user phrase genuinely supports multiple DISTINCT semantic interpretations (e.g., ambiguous meaning or different category/direction). Do not fabricate variations; each extra suggestion must represent a different plausible meaning.
+
+          Do NOT output multiple suggestions that only differ by minor adjectives (e.g., only color/size/condition). Prefer a single best enriched formulation. Put such specifics into attributes (e.g., {color:"красный"}) or leave null if unknown. If there are several possible values (e.g., красный/зеленый), list them as options inside attributes (e.g., {color:["красный","зеленый"]}) — do NOT create separate suggestions for each.
+
+          Be domain-smart with facets. For bicycles, recognize types and tech details: type (горный|шоссейный|городской|BMX|гибрид), frameSize, wheelSize, brakeType (дисковые|ободные; гидравлические|механические), suspension (hardtail|full|rigid), drivetrain, condition, mileage, color, price, currency, location, delivery. Reflect key aspects as facets (e.g., "горный велосипед", "дисковые тормоза") and as attributes where structured values are appropriate. If the phrase implies "горный", you may infer typical aspects (e.g., усиленная рама/тормоза) as facets — but keep unknowns in attributes as null or hints in template.
+
+          Output MUST be valid JSON: {"suggestions":[{"text":"...","facets":["..."],"category":"market|rideshare|learning|teaching|service|housing|job|event|other","direction":"sell|buy|offer|seek|learn|teach","attributes":{...},"template":"..."}, ...]}.
+          Attributes per category (only include relevant keys):
+          market: {brand,model,condition,year,color,size,quantity,price,currency,location,delivery,warranty};
+          rideshare: {route:{from,to},date,time,seats,vehicle:{make,model,year},amenities:["AC","heater","orthopedicSeats"],luggageAllowed:boolean};
+          learning/teaching: {subject,level,language,modality,location,schedule,pricePerHour,currency};
+          service: {serviceType,area,availability,price,currency}; housing: {location,rooms,size,price,currency,furnished}; job: {role,location,salary,currency,schedule}.
+          If a detail is unknown, omit it or use null. Add a helpful "template" string that a user can copy and edit; for unknowns, put bracketed hints like [укажите дату].
+
+          Examples:
+          Input: "хочу продать горный велосипед" → keep SELL: category=market,direction=sell; facets may include: "горный велосипед", "дисковые тормоза"; attributes: {brand?, model?, condition?, frameSize?, wheelSize?, brakeType?, suspension?, color?, price?, currency?, location?}; template includes: Тип/особенности, Размер рамы, Диаметр колес, Тормоза, Подвеска, Состояние, Цвет, Цена, Город.
+          Input: "ищу попутчика Москва → Казань завтра" → rideshare, direction=seek; add route.from, route.to, date, time, seats?, vehicle?, amenities?; template includes: Маршрут, Дата/время, Места, Авто, Опции.
+          Input: "могу учить гитаре онлайн" → teaching, direction=teach; add subject, modality=online, schedule, pricePerHour.
+        `
       },
       {
         role: 'user',
-        content: `Rephrase this (keep exact same wish): "${text}"\nLanguage: ${lang || 'auto'}`,
+        content: `Language: ${lang || 'auto'}\nUser intent: "${text}"\n\nReturn ONLY JSON with suggestions as specified. Preserve intent type and add attributes/facets/template. Respect the 1-or-up-to-3 variants rule.`,
       },
     ],
     max_tokens: ASSIST_MAX_TOKENS + 50,
@@ -309,13 +331,57 @@ async function _openaiAssistContinue({ text, lang }) {
     
     const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
     
-    // Нормализация: если пришёл массив строк, оборачиваем в объекты
+    // Нормализация: поддержать расширенную структуру (category, direction, attributes, questions, template, example)
     const normalized = suggestions.map(s => {
-      if (typeof s === 'string') return { text: s, facets: [] };
-      return { text: s.text || '', facets: Array.isArray(s.facets) ? s.facets : [] };
+      if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, questions: [], template: null, example: null };
+      return {
+        text: s.text || '',
+        facets: Array.isArray(s.facets) ? s.facets : [],
+        category: typeof s.category === 'string' ? s.category : null,
+        direction: typeof s.direction === 'string' ? s.direction : null,
+        attributes: s && typeof s.attributes === 'object' && !Array.isArray(s.attributes) && s.attributes ? s.attributes : {},
+        questions: Array.isArray(s.questions)
+          ? s.questions.filter(q => q && typeof q === 'object').slice(0, 12).map(q => ({
+              key: typeof q.key === 'string' ? q.key : null,
+              label: typeof q.label === 'string' ? q.label : null,
+              required: typeof q.required === 'boolean' ? q.required : false,
+              type: typeof q.type === 'string' ? q.type : null,
+              options: Array.isArray(q.options) ? q.options.slice(0, 20).map(x => String(x)) : undefined,
+              hint: typeof q.hint === 'string' ? q.hint : undefined,
+            }))
+          : [],
+        template: typeof s.template === 'string' ? s.template : null,
+        example: typeof s.example === 'string' ? s.example : null,
+      };
     });
 
-    return normalized.filter(s => s.text.length >= 10);
+    // Фильтрация по длине
+    let filtered = normalized.filter(s => s.text.length >= 10);
+
+    // Удалить дубликаты по text (case-insensitive)
+    const seenTexts = new Set();
+    filtered = filtered.filter(s => {
+      const k = s.text.trim().toLowerCase();
+      if (seenTexts.has(k)) return false;
+      seenTexts.add(k);
+      return true;
+    });
+
+    // Определить уникальные смысловые ключи (category+direction). Если все один смысл → оставить только первый.
+    const meaningKeys = new Set(filtered.map(s => `${s.category || ''}|${s.direction || ''}`));
+    if (meaningKeys.size <= 1 && filtered.length > 1) {
+      filtered = filtered.slice(0, 1);
+    } else if (meaningKeys.size > 1) {
+      // Сгруппировать по смыслу и взять не более 3 разных смыслов (первый элемент каждого).
+      const byMeaning = new Map();
+      for (const s of filtered) {
+        const mk = `${s.category || ''}|${s.direction || ''}`;
+        if (!byMeaning.has(mk)) byMeaning.set(mk, s);
+      }
+      filtered = Array.from(byMeaning.values()).slice(0, 3);
+    }
+
+    return filtered;
   } finally {
     clearTimeout(t);
   }
@@ -353,7 +419,8 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-    const cacheKey = _hash(`v7|${lang}|${cleaned}`);
+  // bump cache version due to prompt & variant logic change
+  const cacheKey = _hash(`v9|${lang}|${cleaned}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
