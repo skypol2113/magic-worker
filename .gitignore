@@ -5,3 +5,7 @@ service-account.json
 *.pem
 .env
 node_modules/.env.docker
+
+# test coverage
+coverage/
+*.lcov
