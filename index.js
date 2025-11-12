@@ -355,34 +355,96 @@ async function _openaiAssistContinue({ text, lang }) {
     messages: [
       {
         role: 'system',
-        content: `You are an Intent Completeness Analyzer for MagicAIbox.
-        TASK: Preserve original direction/type (sell/buy/offer/seek/learn/teach). Never invert. Identify which key semantic fields are ALREADY IMPLIED and which are MISSING but HIGH-VALUE to make the intent actionable.
-        Core domains: market, rideshare, learning, teaching, service, housing, job, event, other.
-        Typical field buckets (pick relevant only): time, date, place/location, duration, price, currency, quantity, condition/state, quality/spec, capacity/seats, route(from,to), schedule, modality(online/offline), role, subject, level, size/dimensions.
-        OUTPUT RULES:
-        1) Always return EXACTLY 1 suggestion object unless genuine ambiguity (then up to 2-3 max).
-        2) Each suggestion object MUST have: text, category, direction, facets[], attributes{}, missingFields[], recommendedFields[].
-        3) missingFields: array of field keys NOT present but strongly expected for clarity (e.g., ['price','location']).
-        4) recommendedFields: optional enrichers that add precision but are not strictly mandatory (e.g., ['condition','brand']).
-        5) Keep arrays short (<=8 total between missing + recommended). Order: most critical first.
-        6) facets: short semantic tags actually present or confidently inferable.
-        7) attributes: only the fields confidently present (or directly stated). Do NOT hallucinate values; use null if uncertain.
-        8) NO verbose prose, NO questions list, NO example template in this mode.
-        STRICT JSON ONLY -> {"suggestions":[{"text":"...","category":"market|rideshare|learning|teaching|service|housing|job|event|other","direction":"sell|buy|offer|seek|learn|teach","facets":["..."],"attributes":{...},"missingFields":["..."],"recommendedFields":["..."]}]}
-        If nothing is missing, missingFields = []. Do not invent irrelevant fields.
-        Example minimal:
-        Input: "продам ноутбук" -> missingFields:['price','condition','location'], recommendedFields:['year','brand','ram','storage'].
-        Input: "ищу попутчика Москва Казань завтра утром" -> missingFields:['seats'], recommendedFields:['vehicle','luggageAllowed'].
-        Input: "учу гитаре онлайн" -> direction=teach; missingFields:['schedule','pricePerHour'], recommendedFields:['level','language'].
-        Be concise.`
+        content: `You are a Magic Intent Assistant for MagicAIbox - a smart helper that guides users to create complete, matchable intents.
+
+YOUR MISSION: Help users create intents that will naturally reach 75%+ semantic similarity with matching counterparts. Think like a matchmaker - what details would help two people connect?
+
+CORE PRINCIPLES:
+1. PRESERVE ORIGINAL DIRECTION (sell/buy/offer/seek/learn/teach) - NEVER invert or change intent type
+2. Understand CONTEXT deeply - market, rideshare, learning, teaching, service, housing, job, event, social, other
+3. Ask SMART QUESTIONS that matter for matching - not just fields, but meaningful clarifications
+4. Be CONVERSATIONAL and HELPFUL - like a wise friend, not a form
+
+SMART QUESTIONING STRATEGY:
+- For MARKET (sell/buy): Focus on what makes this item unique and desirable (condition, price range, location, key specs)
+- For RIDESHARE: Critical path details (route, timing, seats, cost-sharing expectations)
+- For LEARNING/TEACHING: Match factors (subject depth, schedule flexibility, format preference, skill level)
+- For SERVICES: Scope, location, timing, budget, specific needs
+- For SOCIAL/CONNECTION: Common interests, activity preferences, location/timing
+
+OUTPUT STRUCTURE:
+{"suggestions":[{
+  "text": "Enhanced version showing what COULD be (keep original meaning, add 1-2 key details naturally)",
+  "category": "market|rideshare|learning|teaching|service|housing|job|event|social|other",
+  "direction": "sell|buy|offer|seek|learn|teach",
+  "facets": ["key", "semantic", "tags"],
+  "attributes": {"field": "value or null if unknown"},
+  "missingFields": ["critical_field1", "critical_field2"],
+  "recommendedFields": ["nice_to_have1", "nice_to_have2"],
+  "smartQuestions": [
+    {"field": "price", "question": "What's your price range?", "why": "Helps match with buyers in your budget"},
+    {"field": "location", "question": "Where are you located?", "why": "Find nearby matches faster"}
+  ]
+}]}
+
+FIELD TAXONOMY (pick relevant only):
+- Core: price, location, date, time, duration
+- People: peopleCount, seats, capacity, quantity
+- Money: budget, pricePerHour, currency
+- Specs: condition, brand, year, model, size, color
+- Learning: subject, level, language, schedule, modality
+- Rideshare: from, to, departureTime, seats, costShare
+- Service: scope, expertise, availability, rate
+- Social: interests, activities, frequency
+
+SMART QUESTIONS RULES:
+1. Ask 2-4 questions MAX (most impactful for matching)
+2. Each question must include:
+   - field: technical field name
+   - question: natural, friendly question
+   - why: brief explanation of matching value
+3. Order by importance for matching
+4. Make questions conversational, not robotic
+5. Focus on details that increase similarity score
+
+EXAMPLES:
+Input: "продам ноутбук"
+Output: {
+  "text": "Продам ноутбук в хорошем состоянии",
+  "category": "market",
+  "direction": "sell",
+  "missingFields": ["price", "location", "condition"],
+  "recommendedFields": ["brand", "year"],
+  "smartQuestions": [
+    {"field": "price", "question": "Какая цена?", "why": "Покупатели ищут в своём бюджете"},
+    {"field": "location", "question": "Где находится?", "why": "Найдём покупателей поблизости"},
+    {"field": "brand", "question": "Какой бренд?", "why": "Кто-то ищет конкретную марку"}
+  ]
+}
+
+Input: "нужна помощь с покупками"
+Output: {
+  "text": "Нужна помощь с покупками и немного общения",
+  "category": "service",
+  "direction": "seek",
+  "missingFields": ["location", "schedule"],
+  "recommendedFields": ["frequency", "budget"],
+  "smartQuestions": [
+    {"field": "location", "question": "В каком районе?", "why": "Найдём помощника рядом"},
+    {"field": "schedule", "question": "Как часто нужна помощь?", "why": "Поможет найти того, кто свободен в это время"},
+    {"field": "details", "question": "Что именно нужно покупать?", "why": "Уточним объём помощи"}
+  ]
+}
+
+Return ONLY valid JSON. Be magic! 🪄`
       },
       {
         role: 'user',
-        content: `Language: ${lang || 'auto'}\nRaw intent: "${text}"\nReturn ONLY JSON with suggestions[]. Include missingFields & recommendedFields. No questions, no examples.`,
+        content: `Language: ${lang || 'auto'}\nIntent: "${text}"\n\nAnalyze and return JSON with: enhanced text, fields, and 2-4 smart questions that will help this intent match better.`,
       },
     ],
-  max_tokens: 600,
-  temperature: 0.4,
+  max_tokens: 800,
+  temperature: 0.5,
     n: 1,
     response_format: { type: 'json_object' },
   };
@@ -420,9 +482,15 @@ async function _openaiAssistContinue({ text, lang }) {
     
     const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
     
-    // Нормализация: поддержать расширенную структуру (category, direction, attributes, facets, missing/recommended)
+    // Нормализация: поддержать расширенную структуру (category, direction, attributes, facets, missing/recommended, smartQuestions)
     const normalized = suggestions.map(s => {
-      if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, missingFields: [], recommendedFields: [] };
+      if (typeof s === 'string') return { text: s, facets: [], category: null, direction: null, attributes: {}, missingFields: [], recommendedFields: [], smartQuestions: [] };
+      
+      // Обработка smartQuestions
+      const smartQuestions = Array.isArray(s.smartQuestions) 
+        ? s.smartQuestions.slice(0, 4).filter(q => q && typeof q === 'object' && q.field && q.question)
+        : [];
+      
       return {
         text: s.text || '',
   facets: Array.isArray(s.facets) ? s.facets.slice(0, ASSIST_FACETS_MAX).map(x => String(x)) : [],
@@ -431,6 +499,7 @@ async function _openaiAssistContinue({ text, lang }) {
         attributes: s && typeof s.attributes === 'object' && !Array.isArray(s.attributes) && s.attributes ? s.attributes : {},
   missingFields: Array.isArray(s.missingFields) ? s.missingFields.slice(0, ASSIST_MISSING_MAX).map(x => String(x)) : [],
   recommendedFields: Array.isArray(s.recommendedFields) ? s.recommendedFields.slice(0, ASSIST_RECOMMENDED_MAX).map(x => String(x)) : [],
+        smartQuestions,
       };
     });
 
@@ -498,8 +567,8 @@ async function _assistHandler(req, res) {
 
     if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: 'no_ai_provider' });
 
-  // bump cache version: v13 (env-based caps for facets/missing/recommended)
-  const cacheKey = _hash(`v13|${lang}|${cleaned}|${ASSIST_FACETS_MAX}|${ASSIST_MISSING_MAX}|${ASSIST_RECOMMENDED_MAX}`);
+  // bump cache version: v14 (smart questions for better matching)
+  const cacheKey = _hash(`v14|${lang}|${cleaned}|${ASSIST_FACETS_MAX}|${ASSIST_MISSING_MAX}|${ASSIST_RECOMMENDED_MAX}`);
     const cached = _cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, items: cached, cached: true, ms: Date.now() - t0, godMode: APP_MODE === 'god' });
 
