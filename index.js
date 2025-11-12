@@ -693,6 +693,23 @@ function generateMatchText(normalizedText, category) {
   return templates[category] || templates.default;
 }
 
+// Check if two intents are counterparts (opposite directions)
+function isCounterpartDirection(dir1, dir2) {
+  if (!dir1 || !dir2) return true; // if no direction, allow match (for backward compatibility)
+  
+  const counterparts = {
+    sell: ['buy', 'seek'],
+    buy: ['sell', 'offer'],
+    offer: ['seek', 'buy'],
+    seek: ['offer', 'sell'],
+    teach: ['learn'],
+    learn: ['teach'],
+  };
+  
+  const validCounterparts = counterparts[dir1.toLowerCase()] || [];
+  return validCounterparts.includes(dir2.toLowerCase());
+}
+
 async function selectCounterpartsForIntent(srcId, srcData, limit = EMBEDDINGS_TOP_K) {
   // если уже есть матч — не плодим дубликаты
   try {
@@ -728,6 +745,15 @@ async function selectCounterpartsForIntent(srcId, srcData, limit = EMBEDDINGS_TO
         const targetRef = db.collection('intents').doc(d.id);
         const targetText = await getNormalizedText(targetRef, x);
         if (!targetText.trim()) return null;
+
+        // Check if directions are counterparts (opposite)
+        const srcDirection = srcData.direction || null;
+        const targetDirection = x.direction || null;
+        
+        if (srcDirection && targetDirection && !isCounterpartDirection(srcDirection, targetDirection)) {
+          // Skip if not counterpart directions (e.g., both are 'sell')
+          return null;
+        }
 
         if (EMBEDDINGS_ENABLED) {
           const score = await translators.semanticSimilarity(text, targetText);

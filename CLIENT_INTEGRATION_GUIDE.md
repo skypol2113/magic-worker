@@ -29,6 +29,8 @@ final data = jsonDecode(response.body);
   "ok": true,
   "items": [{
     "text": "Улучшенный текст интента",
+    "category": "market",
+    "direction": "sell",
     "smartQuestions": [
       {
         "field": "price",
@@ -149,6 +151,49 @@ class AssistItem {
   }
 }
 ```
+
+## ⚠️ КРИТИЧЕСКИ ВАЖНО: Сохранение `category` и `direction`
+
+При создании интента в Firestore **обязательно сохраните** поля `category` и `direction` из ответа ассистента:
+
+```dart
+// Создание интента в Firestore
+await FirebaseFirestore.instance.collection('intents').add({
+  'userId': currentUserId,
+  'text': assistItem.text,
+  'category': assistItem.category,     // ⚠️ ОБЯЗАТЕЛЬНО!
+  'direction': assistItem.direction,   // ⚠️ ОБЯЗАТЕЛЬНО!
+  'createdAt': FieldValue.serverTimestamp(),
+  'status': 'new',
+  // ... другие поля
+});
+```
+
+### Почему это важно?
+
+1. **Качественный матчинг**: Worker матчит только встречные направления:
+   - `sell` ↔ `buy` или `seek` ✅
+   - `sell` ↔ `sell` ❌ (не матчит)
+   - `offer` ↔ `seek` ✅
+   - `teach` ↔ `learn` ✅
+
+2. **Валидные направления**:
+   - `sell` — продаю товар
+   - `buy` — куплю товар
+   - `offer` — предлагаю услугу
+   - `seek` — ищу услугу
+   - `teach` — обучаю
+   - `learn` — хочу научиться
+
+3. **Валидные категории**:
+   - `market` — товары
+   - `service` — услуги
+   - `learning` — обучение
+   - `rideshare` — попутчики
+   - `social` — знакомства
+   - `general` — прочее
+
+**Без этих полей система будет матчить все интенты подряд, включая одинаковые направления!**
 
 ## UX Рекомендации
 
