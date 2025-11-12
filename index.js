@@ -1649,6 +1649,52 @@ app.post('/api/match/translate', async (req, res) => {
   }
 });
 
+// ===== Translate chat message =====
+app.post('/api/message/translate', async (req, res) => {
+  try {
+    const { matchId, messageId, targetLang = 'en' } = req.body || {};
+    
+    if (!matchId) return res.status(400).json({ ok: false, error: 'matchId_required' });
+    if (!messageId) return res.status(400).json({ ok: false, error: 'messageId_required' });
+    if (!firebaseLoaded || !db) return res.status(503).json({ ok: false, error: 'firebase_unavailable' });
+
+    const msgRef = db.collection('matches').doc(matchId).collection('messages').doc(messageId);
+    const msgSnap = await msgRef.get();
+    
+    if (!msgSnap.exists) return res.status(404).json({ ok: false, error: 'message_not_found' });
+
+    const message = msgSnap.data() || {};
+    const textToTranslate = message.text || '';
+    
+    if (!textToTranslate) {
+      return res.status(400).json({ ok: false, error: 'text_empty' });
+    }
+
+    // Check cache
+    const cached = message.translations?.[targetLang];
+    
+    if (cached) {
+      return res.json({ ok: true, translated: cached, cached: true, targetLang, originalLang: message.lang });
+    }
+
+    // Translate
+    const translated = await translators.translate(textToTranslate, targetLang);
+    
+    // Save to cache
+    await msgRef.set({
+      translations: {
+        [targetLang]: translated
+      },
+      updatedAt: FV.serverTimestamp()
+    }, { merge: true });
+
+    return res.json({ ok: true, translated, cached: false, targetLang, originalLang: message.lang });
+  } catch (e) {
+    console.error('/api/message/translate error:', e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // ===== Assist feedback (self-learning) =====
 app.post('/api/assist/feedback', async (req, res) => {
   try {
