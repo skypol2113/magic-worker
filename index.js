@@ -902,6 +902,25 @@ async function readPublicMeta(uid) {
   }
 }
 
+async function translateWithRetries(text, targetLang, sourceLang, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔄 Translation attempt ${attempt}/${maxRetries} | ${sourceLang} → ${targetLang}`);
+      return await translators.translateToEn(text, sourceLang);
+    } catch (error) {
+      console.log(`❌ Translation attempt ${attempt}/${maxRetries} failed:`, error.message);
+      
+      if (attempt === maxRetries) {
+        throw new Error(`Translation failed after ${maxRetries} attempts: ${error.message}`);
+      }
+      
+      const delay = 500 * Math.pow(2, attempt - 1); // 500ms → 1s → 2s
+      console.log(`⏳ Retrying after ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function ensureNormalized(docRef, doc) {
   const raw = doc.text || '';
   const text = dehtml(raw);
@@ -918,32 +937,47 @@ async function ensureNormalized(docRef, doc) {
     detected = 'und';
   }
 
+  console.log(`🔮 Processing normalize | Stage: language | Detected: ${detected}`);
+
   let normalizedText = text;
   let translated = false;
   let provider = process.env.TRANSLATOR_PROVIDER || 'gct';
   let providerMs = 0;
+  let failed = false;
+  let error = null;
 
   if ((detected || '').toLowerCase() !== 'en') {
     try {
-      const res = await translators.translateToEn(text, detected || 'auto');
+      const res = await translateWithRetries(text, 'en', detected || 'auto');
       normalizedText = res.text || text;
       provider = res.provider || provider;
       providerMs = res.ms || 0;
       translated = !res.fallback;
-    } catch {
+      console.log(`✅ Translation successful | Lang: ${detected} → en`);
+    } catch (e) {
+      console.log(`❌ Translation failed | Lang: ${detected} | Error: ${e.message}`);
       normalizedText = text;
       translated = false;
+      failed = true;
+      error = e.message || 'Translation failed';
     }
   }
 
+  // ✨ НОВОЕ: Сохраняем sourceLang в корень + улучшенный normalized
   await docRef.set({
+    sourceLang: detected || 'und',
+    workerLastRun: FV.serverTimestamp(),
+    workerVersion: process.env.WORKER_VERSION || 'magicbox-worker-2.0',
+    workerProcessed: true,
     normalized: {
       lang: 'en',
-      text: normalizedText,
+      text: failed ? null : normalizedText,
       detectedLang: detected || 'und',
       translated,
       provider,
       providerMs,
+      failed,
+      error,
       _sourceText: raw,
       updatedAt: FV.serverTimestamp(),
     },
@@ -952,7 +986,7 @@ async function ensureNormalized(docRef, doc) {
   const targets = (process.env.TARGET_LOCALES || '')
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
-  if (targets.length) {
+  if (targets.length && !failed) {
     const detectedLang = (detected || 'und').toLowerCase();
     const srcText = raw;
     const enText = normalizedText;
@@ -989,21 +1023,28 @@ async function processGenericDoc(kind, doc) {
 
   const textRaw = data.text || '';
   const status = data.status;
-  console.log(`🔮 Processing ${kind}:`, { id: doc.id, status, uid: data.userId || data.uid || 'unknown', text: short(textRaw, 60) });
+  console.log(`🔮 Processing ${kind}: ${doc.id} | Status: ${status} | User: ${data.userId || data.uid || 'unknown'} | Text: ${short(textRaw, 60)}`);
 
   await new Promise((r) => setTimeout(r, 300));
 
   const isIntent = kind === 'INTENT';
   const parentRef = isIntent ? db.collection('intents').doc(doc.id) : db.collection('wishes').doc(doc.id);
 
-  try { await ensureNormalized(parentRef, data); } catch (e) { console.warn('normalize:', e.message || e); }
+  try { 
+    console.log(`🔮 Processing ${kind}: ${doc.id} | Stage: normalize`);
+    await ensureNormalized(parentRef, data); 
+  } catch (e) { 
+    console.error(`❌ Processing ${kind}: ${doc.id} | Stage: normalize | Error:`, e.message || e);
+  }
 
   if (isIntent) {
+    console.log(`🔮 Processing ${kind}: ${doc.id} | Stage: matching`);
     const updatedSnap = await parentRef.get();
     const currentData = updatedSnap.data() || {};
     const normalizedText = currentData.normalized?.text || textRaw;
 
     const cps = await selectCounterpartsForIntent(doc.id, currentData, MATCH_TOP_N);
+    console.log(`🔮 Processing ${kind}: ${doc.id} | Stage: matching | Found ${cps.length} counterparts`);
 
     const batch = db.batch();
     const createdIds = [];
