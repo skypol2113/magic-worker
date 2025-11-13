@@ -256,6 +256,10 @@ app.use((req, res, next) => {
   next();
 });
 
+// REST API роуты
+const apiRoutes = require('./api/rest');
+app.use('/api', apiRoutes);
+
 // Короткий отчёт об окружении
 console.log('🎯 Magic Worker');
 console.log('🔧 Env:', {
