@@ -103,4 +103,37 @@ router.get('/wishes/:wishId/status', async (req, res) => {
   }
 });
 
+// Получение желания по ID для тестирования
+router.get('/wishes/:wishId', async (req, res) => {
+  try {
+    const { wishId } = req.params;
+    
+    const wishDoc = await db.collection(COLLECTIONS.WISHES).doc(wishId).get();
+    
+    if (!wishDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Wish not found',
+        app: 'com.magicai.box'
+      });
+    }
+
+    const wishData = { id: wishDoc.id, ...wishDoc.data() };
+    
+    res.json({
+      success: true,
+      wish: wishData,
+      app: 'com.magicai.box'
+    });
+
+  } catch (error) {
+    console.error('Error fetching wish:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      app: 'com.magicai.box'
+    });
+  }
+});
+
 module.exports = router;

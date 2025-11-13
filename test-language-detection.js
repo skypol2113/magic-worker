@@ -8,6 +8,9 @@ const testCases = [
   { text: "მე მინდა ვიყიდო ავტომობილი", expected: "ka", description: "Грузинский: Я хочу купить машину" }
 ];
 
+const SERVER_HOST = '45.136.57.119';
+const SERVER_PORT = 3000;
+
 async function testLanguageDetection() {
   console.log("🧪 Testing language detection...\n");
   
@@ -16,8 +19,8 @@ async function testLanguageDetection() {
       const postData = JSON.stringify({ text: testCase.text });
       
       const options = {
-        hostname: '127.0.0.1',
-        port: 3000,
+        hostname: SERVER_HOST,
+        port: SERVER_PORT,
         path: '/api/detect',
         method: 'POST',
         headers: {
