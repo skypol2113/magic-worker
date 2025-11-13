@@ -941,6 +941,19 @@ async function ensureNormalized(docRef, doc) {
     detected = 'und';
   }
 
+  // Нормализуем устаревшие коды языков Google Translate
+  const LEGACY_LANG_MAP = {
+    'iw': 'he',  // Hebrew: iw (legacy) → he (modern ISO 639-1)
+    'jw': 'jv',  // Javanese: jw → jv
+    'in': 'id',  // Indonesian: in → id
+  };
+  
+  if (detected && LEGACY_LANG_MAP[detected]) {
+    const original = detected;
+    detected = LEGACY_LANG_MAP[detected];
+    console.log(`🔄 Language code normalized: ${original} → ${detected}`);
+  }
+
   console.log(`🔮 Processing normalize | Stage: language | Detected: ${detected}`);
 
   let normalizedText = text;

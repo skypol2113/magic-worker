@@ -6,7 +6,7 @@ module.exports = {
     exec_mode: 'fork',
     env: {
       NODE_ENV: 'production',
-      WORKER_VERSION: 'magicbox-worker-2.1'
+      WORKER_VERSION: 'magicbox-worker-2.1.1'
     },
     // PM2 автоматически загружает .env файл из cwd
     cwd: '/opt/magic-worker',
