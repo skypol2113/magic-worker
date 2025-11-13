@@ -18,7 +18,7 @@ router.post('/wishes', async (req, res) => {
       category: category || 'general',
       language: language || 'auto',
       appId: 'com.magicai.box',
-      status: 'pending',
+      status: 'published',  // Worker слушает только published
       createdAt: new Date(),
       updatedAt: new Date()
     };
