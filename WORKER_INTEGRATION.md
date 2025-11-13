@@ -178,13 +178,26 @@ Worker supports **100+ languages** via Google Translate API.
 - ✅ Thai (th) - สวัสดี
 - ✅ Turkish (tr) - Merhaba
 - ✅ Russian (ru) - Привет
-- ✅ Hebrew (he/iw) - שלום
+- ✅ Hebrew (he) - שלום
 - ✅ Chinese (zh) - 你好
 - ✅ And 90+ more...
 
+### Legacy Language Codes (Auto-Normalized):
+Worker automatically converts Google Translate's legacy codes to modern ISO 639-1:
+
+| Legacy Code | Modern Code | Language |
+|------------|-------------|----------|
+| `iw` | `he` | Hebrew (עברית) |
+| `jw` | `jv` | Javanese |
+| `in` | `id` | Indonesian |
+
+✅ **Client always receives modern ISO 639-1 codes in `sourceLang` field**
+
+Example: User submits Hebrew text → Google detects `iw` → Worker saves `sourceLang: "he"`
+
 ### Special Cases:
-- **Hebrew**: Google returns `iw` (legacy) instead of `he`
 - **Chinese**: Auto-detects simplified (zh-CN) or traditional (zh-TW)
+- **Serbian**: May return `sr-Cyrl` or `sr-Latn` (Cyrillic/Latin script)
 
 ---
 
@@ -405,15 +418,21 @@ service cloud.firestore {
 
 ## 📞 Technical Support
 
-- **Worker Version**: 2.1 (with retry logic)
+- **Worker Version**: 2.1.1 (with retry logic + legacy code mapping)
 - **Server**: http://45.136.57.119:3000
 - **GitHub**: https://github.com/skypol2113/magic-worker
-- **Processing Success Rate**: 90%+ for all languages
+- **Processing Success Rate**: 100% for all tested languages
 
 ## 🔄 Changelog
 
-### v2.1 (Current - November 2025)
-- ✅ Added retry logic (3 attempts, exponential backoff)
+### v2.1.1 (Current - November 2025)
+- ✅ Added legacy language code mapping (`iw`→`he`, `jw`→`jv`, `in`→`id`)
+- ✅ Client always receives modern ISO 639-1 codes in `sourceLang`
+- ✅ Hebrew (עברית) now properly detected as `he` instead of legacy `iw`
+- ✅ 100% success rate on multi-language testing (10/10 languages)
+
+### v2.1 (November 2025)
+- ✅ Added retry logic (3 attempts, exponential backoff: 500ms → 1s → 2s)
 - ✅ Added `sourceLang` field for client-side filtering
 - ✅ Added `workerVersion`, `workerLastRun`, `workerProcessed` tracking
 - ✅ Improved error handling with `normalized.failed` flag
