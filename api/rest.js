@@ -1,6 +1,9 @@
 const express = require('express');
-const { db, COLLECTIONS } = require('../config/firebase');
+const { COLLECTIONS } = require('../config/firebase');
 const router = express.Router();
+
+// Используем глобальный db из index.js
+const getDb = () => global.firestore || require('../config/firebase').db;
 
 // Эндпоинт для Flutter приложения - создание желания
 router.post('/wishes', async (req, res) => {
@@ -20,7 +23,7 @@ router.post('/wishes', async (req, res) => {
       updatedAt: new Date()
     };
 
-    const wishRef = await db.collection(COLLECTIONS.WISHES).add(wishData);
+    const wishRef = await getDb().collection(COLLECTIONS.WISHES).add(wishData);
     
     res.json({
       success: true,
@@ -44,7 +47,7 @@ router.get('/users/:userId/matches', async (req, res) => {
   try {
     const { userId } = req.params;
     
-    const matchesSnapshot = await db.collection(COLLECTIONS.MATCHES)
+    const matchesSnapshot = await getDb().collection(COLLECTIONS.MATCHES)
       .where('userId', '==', userId)
       .where('appId', '==', 'com.magicai.box')
       .orderBy('createdAt', 'desc')
@@ -75,7 +78,7 @@ router.get('/wishes/:wishId/status', async (req, res) => {
   const { wishId } = req.params;
   
   try {
-    const wishDoc = await db.collection(COLLECTIONS.WISHES).doc(wishId).get();
+    const wishDoc = await getDb().collection(COLLECTIONS.WISHES).doc(wishId).get();
     
     if (!wishDoc.exists) {
       return res.status(404).json({ 
@@ -108,7 +111,7 @@ router.get('/wishes/:wishId', async (req, res) => {
   try {
     const { wishId } = req.params;
     
-    const wishDoc = await db.collection(COLLECTIONS.WISHES).doc(wishId).get();
+    const wishDoc = await getDb().collection(COLLECTIONS.WISHES).doc(wishId).get();
     
     if (!wishDoc.exists) {
       return res.status(404).json({ 
