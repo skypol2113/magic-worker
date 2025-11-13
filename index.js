@@ -966,7 +966,8 @@ async function ensureNormalized(docRef, doc) {
   if ((detected || '').toLowerCase() !== 'en') {
     try {
       const res = await translateWithRetries(text, 'en', detected || 'auto');
-      normalizedText = res.text || text;
+      // Декодируем HTML entities из результата перевода (&#39; → ', &quot; → ", etc.)
+      normalizedText = he.decode(res.text || text);
       provider = res.provider || provider;
       providerMs = res.ms || 0;
       translated = !res.fallback;
